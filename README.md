@@ -2,6 +2,10 @@
 
 A unified macOS menu bar app for monitoring AI coding assistant usage across multiple providers.
 
+<p align="center">
+  <img src="https://krishcdbry.com/images/control-tower.png" alt="Control Tower" width="800">
+</p>
+
 ## Supported Providers
 
 | Provider | Auth Method | Features |
