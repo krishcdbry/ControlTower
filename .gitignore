@@ -1,0 +1,39 @@
+# Build artifacts
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj
+xcuserdata/
+
+# App bundle (built locally)
+ControlTower.app/
+*.app
+
+# macOS
+.DS_Store
+*.dSYM
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# Test artifacts
+*.xcresult
+
+# Archives
+*.zip
+*.tar.gz
+*.dmg
+
+# Signing
+*.p12
+*.mobileprovision
