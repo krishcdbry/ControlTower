@@ -679,7 +679,7 @@ struct GlassProviderIcon: View {
 
     private func loadProviderImage() -> NSImage? {
         let imageName = "logo-\(provider.rawValue)"
-        if let url = Bundle.module.url(forResource: imageName, withExtension: "png"),
+        if let url = Bundle.moduleResources.url(forResource: imageName, withExtension: "png"),
            let image = NSImage(contentsOf: url) {
             return image
         }

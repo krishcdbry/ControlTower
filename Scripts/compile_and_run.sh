@@ -53,12 +53,10 @@ if [ -d "$SPARKLE_FRAMEWORK" ]; then
 fi
 
 # Copy resource bundles (SwiftPM resource bundles)
-# Copy to both Contents/Resources AND app root (SwiftPM looks in app root)
 for bundle in "$BUILD_PATH"/*.bundle; do
     if [ -d "$bundle" ]; then
         echo "→ Copying resource bundle: $(basename "$bundle")"
         cp -R "$bundle" "$APP_BUNDLE/Contents/Resources/"
-        cp -R "$bundle" "$APP_BUNDLE/"
     fi
 done
 

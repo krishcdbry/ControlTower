@@ -107,7 +107,7 @@ final class StatusItemController: NSObject {
 
     private func loadMenuBarIcon() -> NSImage? {
         // Try to load custom menu bar icon template
-        if let url = Bundle.module.url(forResource: "menubar-icon", withExtension: "png"),
+        if let url = Bundle.moduleResources.url(forResource: "menubar-icon", withExtension: "png"),
            let image = NSImage(contentsOf: url) {
             return image
         }

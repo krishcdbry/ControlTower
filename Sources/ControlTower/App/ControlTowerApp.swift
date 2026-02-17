@@ -662,7 +662,7 @@ struct SettingsProviderIcon: View {
     private var providerImage: NSImage? {
         let imageName = "logo-\(self.provider.rawValue)"
         // Try to load from bundle resources (SwiftPM uses Bundle.module)
-        if let url = Bundle.module.url(forResource: imageName, withExtension: "png"),
+        if let url = Bundle.moduleResources.url(forResource: imageName, withExtension: "png"),
            let image = NSImage(contentsOf: url) {
             return image
         }
@@ -946,7 +946,7 @@ struct FeatureRow: View {
 extension AboutPane {
     static func loadAppLogo() -> NSImage? {
         // Try to load from bundle resources (SwiftPM uses Bundle.module)
-        if let url = Bundle.module.url(forResource: "logo-controltower", withExtension: "png"),
+        if let url = Bundle.moduleResources.url(forResource: "logo-controltower", withExtension: "png"),
            let image = NSImage(contentsOf: url) {
             return image
         }

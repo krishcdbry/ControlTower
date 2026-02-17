@@ -972,7 +972,7 @@ struct ProviderIconView: View {
     private var providerImage: NSImage? {
         let imageName = "logo-\(provider.rawValue)"
         // Try to load from bundle resources (SwiftPM uses Bundle.module)
-        if let url = Bundle.module.url(forResource: imageName, withExtension: "png"),
+        if let url = Bundle.moduleResources.url(forResource: imageName, withExtension: "png"),
            let image = NSImage(contentsOf: url) {
             return image
         }
