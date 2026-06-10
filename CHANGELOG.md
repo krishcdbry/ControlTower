@@ -5,6 +5,16 @@ All notable changes to Control Tower will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-06-10
+
+### Added
+- The `ct` CLI now ships in the release archive and is installed to your
+  PATH by the Homebrew cask
+
+### Fixed
+- Removed a stale formula from the Homebrew tap that shadowed the cask and
+  broke `brew install` when the `--cask` flag was omitted
+
 ## [1.0.0] - 2026-06-10
 
 First stable release.
