@@ -4,8 +4,8 @@
 class ControlTower < Formula
   desc "Unified menu bar app for monitoring AI coding assistant usage"
   homepage "https://github.com/krishcdbry/ControlTower"
-  url "https://github.com/krishcdbry/ControlTower/archive/refs/tags/v1.0.0-beta.3.tar.gz"
-  sha256 "c074fcd00b74a3b77d2a7d947194bb36cc5658098713b2c0a8c63cb116ff26be"
+  url "https://github.com/krishcdbry/ControlTower/archive/refs/tags/v1.0.0.tar.gz"
+  sha256 "29b850d1c178d90448a3ce04be19894eed574066f70613b210dbbf8bd247ec34"
   license "MIT"
   head "https://github.com/krishcdbry/ControlTower.git", branch: "main"
 
