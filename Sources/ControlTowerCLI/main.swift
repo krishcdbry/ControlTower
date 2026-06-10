@@ -81,6 +81,10 @@ struct ControlTowerCLI {
     }
 
     static func showTokens(arguments: [String]) async {
+        if arguments.first == "codex" {
+            await Self.showCodexTokens()
+            return
+        }
         let started = Date()
         let snapshot = await TokenLedger.shared.snapshot(forceScan: true)
         let elapsed = Date().timeIntervalSince(started)
@@ -147,6 +151,41 @@ struct ControlTowerCLI {
                      stats.isInitialScan ? " [initial index]" : ""))
     }
 
+    static func showCodexTokens() async {
+        let started = Date()
+        let cost = await CodexCostScanner.shared.scan(forceRefresh: true)
+        let snapshot = await CodexLedger.shared.snapshot()
+        let elapsed = Date().timeIntervalSince(started)
+
+        func fmt(_ tokens: Int) -> String {
+            if tokens >= 1_000_000_000 { return String(format: "%.2fB", Double(tokens) / 1_000_000_000) }
+            if tokens >= 1_000_000 { return String(format: "%.1fM", Double(tokens) / 1_000_000) }
+            if tokens >= 1_000 { return String(format: "%.1fK", Double(tokens) / 1_000) }
+            return "\(tokens)"
+        }
+
+        print("Codex Token Ledger")
+        print("==================")
+        print()
+        print("  Period         Tokens     Cost")
+        print("  Today          \(fmt(cost.todayTokens).padding(toLength: 10, withPad: " ", startingAt: 0)) $\(String(format: "%.2f", cost.todayCostUSD))")
+        print("  Last 7 days    \(fmt(cost.last7DaysTokens).padding(toLength: 10, withPad: " ", startingAt: 0)) $\(String(format: "%.2f", cost.last7DaysCostUSD))")
+        print("  Last 30 days   \(fmt(cost.last30DaysTokens).padding(toLength: 10, withPad: " ", startingAt: 0)) $\(String(format: "%.2f", cost.last30DaysCostUSD))")
+
+        if !cost.dailyCosts.isEmpty {
+            print()
+            print("Days with activity (30d): \(cost.dailyCosts.count)")
+        }
+
+        let stats = snapshot.stats
+        print()
+        print(String(format: "Scan: %d files seen, %d parsed, %.1f MB read, %d entries added in %.2fs (total %.2fs)%@",
+                     stats.filesSeen, stats.filesParsed,
+                     Double(stats.bytesParsed) / 1_048_576,
+                     stats.entriesAdded, stats.duration, elapsed,
+                     stats.isInitialScan ? " [initial index]" : ""))
+    }
+
     private static let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm"
@@ -177,6 +216,7 @@ struct ControlTowerCLI {
         COMMANDS:
             status, s       Show usage status for all providers
             tokens, t       Show Claude token usage and costs (all apps)
+            tokens codex    Show Codex token usage and costs
             list, l         List supported providers
             version, -v     Print version information
             help, -h        Show this help message

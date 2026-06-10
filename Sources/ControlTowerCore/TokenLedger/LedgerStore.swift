@@ -2,6 +2,11 @@ import Foundation
 import GRDB
 
 /// Per-file ingestion cursor.
+///
+/// `auxInt`/`auxText` carry parser state that must survive across incremental
+/// scans; their meaning is provider-specific (the Claude ingestor leaves them
+/// at defaults; the Codex ingestor stores the last cumulative token total and
+/// the session's current model).
 struct LedgerFileCursor: Sendable, Equatable {
     let path: String
     let size: Int64
@@ -9,6 +14,8 @@ struct LedgerFileCursor: Sendable, Equatable {
     let offset: Int64
     let source: String
     let project: String
+    var auxInt: Int64 = 0
+    var auxText: String = ""
 }
 
 /// One (hour, model, source, project) aggregate row.
@@ -89,6 +96,14 @@ final class LedgerStore: Sendable {
             try db.create(index: "idx_usage_hours_hour", on: "usage_hours", columns: ["hour_start"])
         }
 
+        // v2: provider-specific cursor state (see LedgerFileCursor).
+        migrator.registerMigration("ledger_v2_cursor_aux") { db in
+            try db.alter(table: "file_cursor") { t in
+                t.add(column: "aux_int", .integer).notNull().defaults(to: 0)
+                t.add(column: "aux_text", .text).notNull().defaults(to: "")
+            }
+        }
+
         try migrator.migrate(self.dbQueue)
     }
 
@@ -97,7 +112,10 @@ final class LedgerStore: Sendable {
     func allCursors() throws -> [String: LedgerFileCursor] {
         try self.dbQueue.read { db in
             var result: [String: LedgerFileCursor] = [:]
-            let rows = try Row.fetchAll(db, sql: "SELECT path, size, mtime, offset, source, project FROM file_cursor")
+            let rows = try Row.fetchAll(
+                db,
+                sql: "SELECT path, size, mtime, offset, source, project, aux_int, aux_text FROM file_cursor"
+            )
             for row in rows {
                 let cursor = LedgerFileCursor(
                     path: row["path"],
@@ -105,7 +123,9 @@ final class LedgerStore: Sendable {
                     mtime: row["mtime"],
                     offset: row["offset"],
                     source: row["source"],
-                    project: row["project"]
+                    project: row["project"],
+                    auxInt: row["aux_int"],
+                    auxText: row["aux_text"]
                 )
                 result[cursor.path] = cursor
             }
@@ -149,7 +169,9 @@ final class LedgerStore: Sendable {
         entries: [ParsedUsageEntry],
         size: Int64,
         mtime: Double,
-        offset: Int64
+        offset: Int64,
+        auxInt: Int64 = 0,
+        auxText: String = ""
     ) throws -> Int {
         try self.dbQueue.write { db in
             var accepted = 0
@@ -193,16 +215,18 @@ final class LedgerStore: Sendable {
 
             try db.execute(
                 sql: """
-                INSERT INTO file_cursor(path, size, mtime, offset, source, project)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO file_cursor(path, size, mtime, offset, source, project, aux_int, aux_text)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path) DO UPDATE SET
                     size = excluded.size,
                     mtime = excluded.mtime,
                     offset = excluded.offset,
                     source = excluded.source,
-                    project = CASE WHEN excluded.project != '' THEN excluded.project ELSE file_cursor.project END
+                    project = CASE WHEN excluded.project != '' THEN excluded.project ELSE file_cursor.project END,
+                    aux_int = excluded.aux_int,
+                    aux_text = excluded.aux_text
                 """,
-                arguments: [path, size, mtime, offset, source, project]
+                arguments: [path, size, mtime, offset, source, project, auxInt, auxText]
             )
 
             return accepted

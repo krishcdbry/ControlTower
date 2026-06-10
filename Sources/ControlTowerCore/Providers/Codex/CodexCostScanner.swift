@@ -1,20 +1,34 @@
 import Foundation
 
-/// Scans Codex CLI JSONL logs to calculate token usage and costs.
+/// Codex token/cost summary used by the dashboard.
+///
+/// This is now a thin adapter over `CodexLedger`, which ingests Codex rollout
+/// files incrementally (per-file byte cursors + monotonic-total dedup + SQLite
+/// aggregates) instead of re-reading every session file on each scan. The
+/// public snapshot shape is unchanged.
+///
+/// Counting semantics (verified against real rollouts): per-turn deltas from
+/// `last_token_usage` are summed; `cached_input_tokens` is a subset of input
+/// and `reasoning_output_tokens` a subset of output, so neither is added on
+/// top when totaling.
 public actor CodexCostScanner {
     public static let shared = CodexCostScanner()
 
     /// Daily cost summary
     public struct DailyCost: Sendable, Equatable {
         public let date: String // YYYY-MM-DD
+        /// Non-cached input tokens.
         public let inputTokens: Int
         public let cachedInputTokens: Int
+        /// Output tokens (reasoning included).
         public let outputTokens: Int
+        /// Reasoning tokens — an informational subset of `outputTokens`.
         public let reasoningTokens: Int
         public let costUSD: Double
 
         public var totalTokens: Int {
-            inputTokens + cachedInputTokens + outputTokens + reasoningTokens
+            // Reasoning is inside outputTokens; adding it would double-count.
+            inputTokens + cachedInputTokens + outputTokens
         }
 
         public init(
@@ -66,97 +80,46 @@ public actor CodexCostScanner {
         }
     }
 
-    private var cachedSnapshot: CostSnapshot?
-    private var lastScanAt: Date?
-    private let minScanInterval: TimeInterval = 60
-
     public init() {}
 
-    /// Scan logs and return cost snapshot
+    /// Scan logs (incrementally) and return a cost snapshot.
     public func scan(forceRefresh: Bool = false) async -> CostSnapshot {
-        let now = Date()
-
-        if !forceRefresh,
-           let cached = cachedSnapshot,
-           let lastScan = lastScanAt,
-           now.timeIntervalSince(lastScan) < minScanInterval
-        {
-            return cached
-        }
-
-        let snapshot = await Self.scanLogs(now: now)
-        self.cachedSnapshot = snapshot
-        self.lastScanAt = now
-        return snapshot
+        let ledger = await CodexLedger.shared.snapshot(forceScan: forceRefresh)
+        return Self.adapt(ledger)
     }
 
-    public func clearCache() {
-        self.cachedSnapshot = nil
-        self.lastScanAt = nil
-    }
+    /// No-op retained for API compatibility; the ledger persists its own state.
+    public func clearCache() {}
 
-    // MARK: - Log Scanning
+    static func adapt(_ ledger: CodexLedgerSnapshot, now: Date = Date()) -> CostSnapshot {
+        var calendar = Calendar.current
+        calendar.timeZone = TimeZone.current
+        let todayKey = TokenLedger.dayKey(for: now, calendar: calendar)
+        let last7Start = TokenLedger.dayKey(for: now.addingTimeInterval(-6 * 86400), calendar: calendar)
 
-    private static func scanLogs(now: Date) async -> CostSnapshot {
-        let sessionsRoot = codexSessionsRoot()
+        var todayCost = 0.0, todayTokens = 0
+        var last7Cost = 0.0, last7Tokens = 0
+        var last30Cost = 0.0, last30Tokens = 0
 
-        guard FileManager.default.fileExists(atPath: sessionsRoot.path) else {
-            return CostSnapshot(updatedAt: now)
-        }
-
-        let calendar = Calendar.current
-        let todayKey = dayKey(from: now)
-        let last7Start = calendar.date(byAdding: .day, value: -6, to: now)!
-        let last30Start = calendar.date(byAdding: .day, value: -29, to: now)!
-        let last7StartKey = dayKey(from: last7Start)
-        let last30StartKey = dayKey(from: last30Start)
-
-        // Find all JSONL files
-        let allFiles = findJSONLFiles(in: sessionsRoot)
-
-        // Parse and aggregate by day
-        var dailyData: [String: DailyAggregator] = [:]
-
-        for fileURL in allFiles {
-            parseJSONLFile(fileURL: fileURL, sinceKey: last30StartKey) { entry in
-                let dayKey = entry.dayKey
-                if dailyData[dayKey] == nil {
-                    dailyData[dayKey] = DailyAggregator(date: dayKey)
-                }
-                dailyData[dayKey]?.add(entry)
+        let dailyCosts = ledger.days.map { day -> DailyCost in
+            last30Cost += day.costUSD
+            last30Tokens += day.totalTokens
+            if day.date >= last7Start {
+                last7Cost += day.costUSD
+                last7Tokens += day.totalTokens
             }
-        }
-
-        // Build daily costs
-        let sortedDays = dailyData.keys.sorted()
-        var dailyCosts: [DailyCost] = []
-
-        var todayCost: Double = 0
-        var todayTokens: Int = 0
-        var last7Cost: Double = 0
-        var last7Tokens: Int = 0
-        var last30Cost: Double = 0
-        var last30Tokens: Int = 0
-
-        for dayKey in sortedDays {
-            guard dayKey >= last30StartKey else { continue }
-            guard let agg = dailyData[dayKey] else { continue }
-
-            let daily = agg.build()
-            dailyCosts.append(daily)
-
-            last30Cost += daily.costUSD
-            last30Tokens += daily.totalTokens
-
-            if dayKey >= last7StartKey {
-                last7Cost += daily.costUSD
-                last7Tokens += daily.totalTokens
+            if day.date == todayKey {
+                todayCost = day.costUSD
+                todayTokens = day.totalTokens
             }
-
-            if dayKey == todayKey {
-                todayCost = daily.costUSD
-                todayTokens = daily.totalTokens
-            }
+            return DailyCost(
+                date: day.date,
+                inputTokens: day.inputTokens,
+                cachedInputTokens: day.cachedInputTokens,
+                outputTokens: day.outputTokens,
+                reasoningTokens: day.reasoningTokens,
+                costUSD: day.costUSD
+            )
         }
 
         return CostSnapshot(
@@ -167,195 +130,80 @@ public actor CodexCostScanner {
             last30DaysCostUSD: last30Cost,
             last30DaysTokens: last30Tokens,
             dailyCosts: dailyCosts,
-            updatedAt: now
+            updatedAt: ledger.generatedAt
         )
-    }
-
-    // MARK: - File Discovery
-
-    private static func codexSessionsRoot() -> URL {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-
-        if let envPath = ProcessInfo.processInfo.environment["CODEX_HOME"],
-           !envPath.isEmpty
-        {
-            return URL(fileURLWithPath: envPath).appendingPathComponent("sessions", isDirectory: true)
-        }
-
-        return home.appendingPathComponent(".codex/sessions", isDirectory: true)
-    }
-
-    private static func findJSONLFiles(in root: URL) -> [URL] {
-        var files: [URL] = []
-
-        guard let enumerator = FileManager.default.enumerator(
-            at: root,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]
-        ) else { return files }
-
-        for case let fileURL as URL in enumerator {
-            if fileURL.pathExtension.lowercased() == "jsonl" {
-                files.append(fileURL)
-            }
-        }
-
-        return files
-    }
-
-    // MARK: - JSONL Parsing
-
-    private struct UsageEntry {
-        let dayKey: String
-        let inputTokens: Int
-        let cachedInputTokens: Int
-        let outputTokens: Int
-        let reasoningTokens: Int
-    }
-
-    private static func parseJSONLFile(
-        fileURL: URL,
-        sinceKey: String,
-        onEntry: (UsageEntry) -> Void
-    ) {
-        guard let data = try? Data(contentsOf: fileURL),
-              let content = String(data: data, encoding: .utf8) else {
-            return
-        }
-
-        // Track seen timestamps to deduplicate (Codex can emit multiple token_count per turn)
-        var lastSeenUsage: (inputTokens: Int, outputTokens: Int)?
-
-        for line in content.components(separatedBy: .newlines) {
-            guard !line.isEmpty,
-                  line.contains("\"type\":\"token_count\""),
-                  line.contains("\"total_token_usage\"") else {
-                continue
-            }
-
-            guard let lineData = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
-                  let timestamp = obj["timestamp"] as? String,
-                  let dayKey = dayKeyFromTimestamp(timestamp),
-                  dayKey >= sinceKey else {
-                continue
-            }
-
-            guard let payload = obj["payload"] as? [String: Any],
-                  let info = payload["info"] as? [String: Any],
-                  let totalUsage = info["total_token_usage"] as? [String: Any] else {
-                continue
-            }
-
-            let inputTokens = (totalUsage["input_tokens"] as? Int) ?? 0
-            let cachedInputTokens = (totalUsage["cached_input_tokens"] as? Int) ?? 0
-            let outputTokens = (totalUsage["output_tokens"] as? Int) ?? 0
-            let reasoningTokens = (totalUsage["reasoning_output_tokens"] as? Int) ?? 0
-
-            // Deduplicate: Codex emits cumulative usage, only count if changed
-            let currentUsage = (inputTokens, outputTokens)
-            if let last = lastSeenUsage, last == currentUsage {
-                continue
-            }
-            lastSeenUsage = currentUsage
-
-            guard inputTokens > 0 || outputTokens > 0 else { continue }
-
-            onEntry(UsageEntry(
-                dayKey: dayKey,
-                inputTokens: inputTokens,
-                cachedInputTokens: cachedInputTokens,
-                outputTokens: outputTokens,
-                reasoningTokens: reasoningTokens
-            ))
-        }
-    }
-
-    // MARK: - Date Helpers
-
-    private static func dayKey(from date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        formatter.timeZone = TimeZone.current
-        return formatter.string(from: date)
-    }
-
-    private static func dayKeyFromTimestamp(_ timestamp: String) -> String? {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-
-        var date = formatter.date(from: timestamp)
-        if date == nil {
-            formatter.formatOptions = [.withInternetDateTime]
-            date = formatter.date(from: timestamp)
-        }
-
-        guard let parsedDate = date else { return nil }
-        return dayKey(from: parsedDate)
-    }
-
-    // MARK: - Aggregation
-
-    private class DailyAggregator {
-        let date: String
-        var inputTokens = 0
-        var cachedInputTokens = 0
-        var outputTokens = 0
-        var reasoningTokens = 0
-
-        init(date: String) {
-            self.date = date
-        }
-
-        func add(_ entry: UsageEntry) {
-            // For Codex, each entry represents cumulative session usage
-            // We take the max per session (since we deduplicate in parsing)
-            inputTokens += entry.inputTokens
-            cachedInputTokens += entry.cachedInputTokens
-            outputTokens += entry.outputTokens
-            reasoningTokens += entry.reasoningTokens
-        }
-
-        func build() -> DailyCost {
-            let cost = CodexPricing.cost(
-                inputTokens: inputTokens,
-                cachedInputTokens: cachedInputTokens,
-                outputTokens: outputTokens,
-                reasoningTokens: reasoningTokens
-            )
-
-            return DailyCost(
-                date: date,
-                inputTokens: inputTokens,
-                cachedInputTokens: cachedInputTokens,
-                outputTokens: outputTokens,
-                reasoningTokens: reasoningTokens,
-                costUSD: cost
-            )
-        }
     }
 }
 
-// MARK: - Codex Pricing (OpenAI o3/o4-mini pricing estimates)
+// MARK: - Codex Pricing
 
+/// Pricing for OpenAI models used by Codex (per million tokens, USD).
+/// Source: OpenAI API pricing (cached 2026-06). Cached input is billed at
+/// a 90% discount on these models. Reasoning tokens are billed as output.
 public enum CodexPricing {
-    // OpenAI o4-mini pricing (per 1M tokens) - estimated
-    private static let inputPricePerMillion: Double = 1.10
-    private static let cachedInputPricePerMillion: Double = 0.275 // 75% discount
-    private static let outputPricePerMillion: Double = 4.40
-    private static let reasoningPricePerMillion: Double = 4.40
+    public struct ModelPrice: Sendable {
+        public let inputPerMillion: Double
+        public let cachedInputPerMillion: Double
+        public let outputPerMillion: Double
 
+        public init(input: Double, output: Double, cachedInput: Double? = nil) {
+            self.inputPerMillion = input
+            self.outputPerMillion = output
+            self.cachedInputPerMillion = cachedInput ?? (input * 0.1)
+        }
+    }
+
+    private static let gpt55 = ModelPrice(input: 5.0, output: 30.0)
+    private static let gpt54 = ModelPrice(input: 2.5, output: 15.0)
+    private static let codex53 = ModelPrice(input: 1.75, output: 14.0)
+    private static let gpt51Family = ModelPrice(input: 1.25, output: 10.0)
+    private static let o3 = ModelPrice(input: 2.0, output: 8.0)
+    private static let o4Mini = ModelPrice(input: 1.10, output: 4.40, cachedInput: 0.275)
+    private static let codexMini = ModelPrice(input: 1.50, output: 6.0)
+
+    public static let pricing: [String: ModelPrice] = [
+        "gpt-5.5": gpt55,
+        "gpt-5.4": gpt54,
+        "gpt-5.3-codex": codex53,
+        "gpt-5.2-codex": codex53,
+        "gpt-5.2": gpt51Family,
+        "gpt-5.1-codex-max": gpt51Family,
+        "gpt-5.1-codex": gpt51Family,
+        "gpt-5.1": gpt51Family,
+        "gpt-5-codex": gpt51Family,
+        "gpt-5": gpt51Family,
+        "codex-mini-latest": codexMini,
+        "o3": o3,
+        "o4-mini": o4Mini,
+    ]
+
+    /// Default for unknown models (the common Codex tier).
+    public static let defaultPricing = gpt51Family
+
+    public static func price(for model: String) -> ModelPrice {
+        let normalized = model.lowercased().trimmingCharacters(in: .whitespaces)
+        if let exact = pricing[normalized] {
+            return exact
+        }
+        if normalized.contains("5.5") { return gpt55 }
+        if normalized.contains("5.4") { return gpt54 }
+        if normalized.contains("5.3") || normalized.contains("5.2-codex") { return codex53 }
+        if normalized.contains("o4-mini") { return o4Mini }
+        if normalized.contains("codex-mini") { return codexMini }
+        return defaultPricing
+    }
+
+    /// Cost for usage where `inputTokens` excludes cached tokens and
+    /// `outputTokens` already includes reasoning.
     public static func cost(
+        model: String,
         inputTokens: Int,
         cachedInputTokens: Int,
-        outputTokens: Int,
-        reasoningTokens: Int
+        outputTokens: Int
     ) -> Double {
-        let inputCost = Double(inputTokens) * inputPricePerMillion / 1_000_000
-        let cachedCost = Double(cachedInputTokens) * cachedInputPricePerMillion / 1_000_000
-        let outputCost = Double(outputTokens) * outputPricePerMillion / 1_000_000
-        let reasoningCost = Double(reasoningTokens) * reasoningPricePerMillion / 1_000_000
-
-        return inputCost + cachedCost + outputCost + reasoningCost
+        let price = Self.price(for: model)
+        return Double(inputTokens) / 1_000_000 * price.inputPerMillion
+            + Double(cachedInputTokens) / 1_000_000 * price.cachedInputPerMillion
+            + Double(outputTokens) / 1_000_000 * price.outputPerMillion
     }
 }
