@@ -882,7 +882,7 @@ struct AboutPane: View {
                     .foregroundStyle(.secondary)
             }
 
-            Text("Version 1.0.0")
+            Text("Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev")")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
                 .padding(.top, 4)
