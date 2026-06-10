@@ -209,7 +209,7 @@ struct ControlTowerCLI {
     }
 
     static func printVersion() {
-        print("Control Tower CLI v1.0.0-beta.3")
+        print("Control Tower CLI v1.0.0")
     }
 
     static func printUsage() {
