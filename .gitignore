@@ -37,3 +37,7 @@ ControlTower.app/
 # Signing
 *.p12
 *.mobileprovision
+
+# Local development tooling (not part of the public source)
+CLAUDE.md
+.claude/
