@@ -16,11 +16,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let usageStore: UsageStore
     let accountStore: AccountStore
     let notificationStore: NotificationHistoryStore
+    let ledgerStore: TokenLedgerStore
 
     // MARK: - Controllers
 
     private var statusItemController: StatusItemController?
     private var database: UsageDatabase?
+    private var transcriptWatcher: TranscriptWatcher?
 
     #if ENABLE_SPARKLE
     private var updaterController: SPUStandardUpdaterController?
@@ -37,6 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.usageStore = UsageStore()
         self.accountStore = AccountStore()
         self.notificationStore = NotificationHistoryStore()
+        self.ledgerStore = TokenLedgerStore()
 
         super.init()
     }
@@ -53,8 +56,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Initialize database
         do {
-            self.database = try UsageDatabase.open()
-            self.usageStore.setDatabase(self.database!)
+            let database = try UsageDatabase.open()
+            self.database = database
+            self.usageStore.setDatabase(database)
             self.logger.info("Database initialized")
         } catch {
             self.logger.error("Failed to initialize database: \(error)")
@@ -79,7 +83,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.statusItemController = StatusItemController(
             settingsStore: self.settingsStore,
             usageStore: self.usageStore,
-            accountStore: self.accountStore
+            accountStore: self.accountStore,
+            ledgerStore: self.ledgerStore
         )
 
         // Start initial refresh
@@ -87,8 +92,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             await self.usageStore.refresh()
         }
 
+        // Warm up the token ledger in the background so the popover opens
+        // with data (the first run indexes transcript history; afterwards
+        // scans are incremental).
+        self.ledgerStore.refresh()
+
+        // Watch transcript directories so token counts update live while
+        // Claude Code / Claude Desktop / Cowork sessions are running.
+        let watchPaths = TokenLedger.watchRoots().map(\.path)
+        self.transcriptWatcher = TranscriptWatcher(paths: watchPaths) { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.ledgerStore.refresh()
+            }
+        }
+
         // Setup refresh timer
         self.setupRefreshTimer()
+        self.observeRefreshIntervalChanges()
 
         self.logger.info("Control Tower ready")
     }
@@ -125,10 +145,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.refreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 await self?.usageStore.refresh()
+                self?.ledgerStore.refresh()
             }
         }
 
         self.logger.info("Refresh timer set to \(Int(interval))s")
+    }
+
+    /// Rebuilds the refresh timer whenever the interval setting changes.
+    private func observeRefreshIntervalChanges() {
+        withObservationTracking {
+            _ = self.settingsStore.refreshInterval
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.setupRefreshTimer()
+                self.observeRefreshIntervalChanges()
+            }
+        }
     }
 
     // MARK: - Actions

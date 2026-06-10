@@ -8,12 +8,12 @@ import SwiftUI
 struct PremiumDashboardView: View {
     @Bindable var usageStore: UsageStore
     @Bindable var settingsStore: SettingsStore
+    var ledgerStore: TokenLedgerStore
     let onRefresh: () -> Void
     let onSettings: () -> Void
     let onQuit: () -> Void
 
     @State private var selectedProvider: ProviderID?
-    @State private var claudeCostSnapshot: ClaudeCostScanner.CostSnapshot?
     @State private var codexCostSnapshot: CodexCostScanner.CostSnapshot?
     @State private var isLoadingCost = false
 
@@ -66,25 +66,23 @@ struct PremiumDashboardView: View {
 
     private func loadCostData() async {
         isLoadingCost = true
-        async let claudeTask = ClaudeCostScanner.shared.scan()
-        async let codexTask = CodexCostScanner.shared.scan()
-        claudeCostSnapshot = await claudeTask
-        codexCostSnapshot = await codexTask
-        isLoadingCost = false
+        defer { isLoadingCost = false }
+        ledgerStore.refresh()
+        codexCostSnapshot = await CodexCostScanner.shared.scan()
     }
 
     private func loadProviderCostData(_ provider: ProviderID?) async {
         guard let provider else { return }
         isLoadingCost = true
+        defer { isLoadingCost = false }
         switch provider {
         case .claude:
-            claudeCostSnapshot = await ClaudeCostScanner.shared.scan()
+            ledgerStore.refresh()
         case .codex:
             codexCostSnapshot = await CodexCostScanner.shared.scan()
         default:
             break
         }
-        isLoadingCost = false
     }
 
     // MARK: - Premium Gradient (Darker)
@@ -231,16 +229,35 @@ struct PremiumDashboardView: View {
 
             // Token Usage Section
             if provider == .claude {
-                if let costData = claudeCostSnapshot {
+                if let ledger = ledgerStore.snapshot {
+                    // Live 5-hour block (burn rate, projection, reset countdown).
+                    if let block = ledger.currentBlock {
+                        GlassLiveBlockCard(block: block)
+                    }
+
                     SimpleTokenSummary(
-                        todayTokens: costData.todayTokens,
-                        todayCost: costData.todayCostUSD,
-                        last7DaysTokens: costData.last7DaysTokens,
-                        last7DaysCost: costData.last7DaysCostUSD,
-                        last30DaysTokens: costData.last30DaysTokens,
-                        last30DaysCost: costData.last30DaysCostUSD
+                        todayTokens: ledger.today.totalTokens,
+                        todayCost: ledger.today.costUSD,
+                        last7DaysTokens: ledger.last7Days.totalTokens,
+                        last7DaysCost: ledger.last7Days.costUSD,
+                        last30DaysTokens: ledger.last30Days.totalTokens,
+                        last30DaysCost: ledger.last30Days.costUSD
                     )
-                } else if isLoadingCost {
+
+                    // Per-app split: Claude Code vs Desktop/Cowork, plus top projects.
+                    if !ledger.bySource.isEmpty {
+                        GlassSourceBreakdownCard(
+                            bySource: ledger.bySource,
+                            topProjects: Array(ledger.byProject.prefix(3))
+                        )
+                    }
+
+                    if ledger.stats.isInitialScan {
+                        Text("Indexed \(ledger.stats.filesParsed) transcripts (\(ledger.stats.entriesAdded) messages)")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.white.opacity(0.4))
+                    }
+                } else if ledgerStore.isLoading || isLoadingCost {
                     TokenLoadingPlaceholder()
                 }
             } else if provider == .codex {
@@ -260,12 +277,12 @@ struct PremiumDashboardView: View {
 
             // Cost Chart
             if provider == .claude {
-                if let costData = claudeCostSnapshot, !costData.dailyCosts.isEmpty {
+                if let ledger = ledgerStore.snapshot, !ledger.days.isEmpty {
                     GlassCostChartCard(
-                        dailyCosts: costData.dailyCosts.map { .init(date: $0.date, totalTokens: $0.totalTokens, costUSD: $0.costUSD) },
-                        updatedAt: costData.updatedAt
+                        dailyCosts: ledger.days.map { .init(date: $0.date, totalTokens: $0.totals.totalTokens, costUSD: $0.totals.costUSD) },
+                        updatedAt: ledger.generatedAt
                     )
-                } else if isLoadingCost {
+                } else if ledgerStore.isLoading || isLoadingCost {
                     ChartLoadingPlaceholder()
                 }
             } else if provider == .codex {
@@ -1578,12 +1595,257 @@ struct GlassProgressStyle: ProgressViewStyle {
     }
 }
 
+// MARK: - Live 5h Block Card
+
+/// Shows the active 5-hour rate-limit block: burn rate, cost pace, and reset
+/// countdown. Re-renders on a timeline so the countdown stays current, and
+/// picks up new token data live as the ledger ingests transcript writes.
+struct GlassLiveBlockCard: View {
+    let block: LedgerBlock
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 30)) { timeline in
+            let now = timeline.date
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    ZStack {
+                        Circle()
+                            .fill(.orange.opacity(0.2))
+                            .frame(width: 28, height: 28)
+                        Image(systemName: "bolt.fill")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.orange)
+                    }
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Current 5h Block")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.white)
+                        Text("Started \(Self.timeFormatter.string(from: block.start))")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.white.opacity(0.5))
+                    }
+
+                    Spacer()
+
+                    VStack(alignment: .trailing, spacing: 1) {
+                        Text(block.remainingDescription(at: now))
+                            .font(.system(size: 13, weight: .bold, design: .rounded))
+                            .foregroundStyle(.orange)
+                        Text("until reset")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.white.opacity(0.5))
+                    }
+                }
+
+                // Elapsed-time progress across the block.
+                GeometryReader { geometry in
+                    let progress = min(1, max(0, now.timeIntervalSince(block.start) / block.end.timeIntervalSince(block.start)))
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(.white.opacity(0.1))
+                        RoundedRectangle(cornerRadius: 3)
+                            .fill(
+                                LinearGradient(
+                                    colors: [.orange, .yellow],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                            .frame(width: geometry.size.width * progress)
+                    }
+                }
+                .frame(height: 6)
+
+                HStack(spacing: 16) {
+                    blockStat("Tokens", value: Self.formatTokens(block.totals.totalTokens))
+                    divider
+                    blockStat("Cost", value: String(format: "$%.2f", block.totals.costUSD))
+                    divider
+                    blockStat("Burn", value: "\(Self.formatTokens(Int(block.burnRate(at: now))))/min")
+                    divider
+                    blockStat("Messages", value: "\(block.totals.entryCount)")
+                }
+            }
+            .padding(16)
+            .background {
+                RoundedRectangle(cornerRadius: 16)
+                    .fill(Color(red: 0.10, green: 0.08, blue: 0.22))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 16)
+                            .stroke(.orange.opacity(0.25), lineWidth: 1)
+                    }
+            }
+        }
+    }
+
+    private var divider: some View {
+        Divider()
+            .frame(height: 24)
+            .overlay(Color.white.opacity(0.1))
+    }
+
+    private func blockStat(_ title: String, value: String) -> some View {
+        VStack(spacing: 3) {
+            Text(value)
+                .font(.system(size: 13, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            Text(title)
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(.white.opacity(0.5))
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private static func formatTokens(_ count: Int) -> String {
+        if count >= 1_000_000_000 { return String(format: "%.2fB", Double(count) / 1_000_000_000) }
+        if count >= 1_000_000 { return String(format: "%.1fM", Double(count) / 1_000_000) }
+        if count >= 1_000 { return String(format: "%.0fK", Double(count) / 1_000) }
+        return "\(count)"
+    }
+
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
+}
+
+// MARK: - Source Breakdown Card
+
+/// 30-day split of where tokens go: Claude Code vs Claude Desktop / Cowork,
+/// plus the heaviest projects.
+struct GlassSourceBreakdownCard: View {
+    let bySource: [UsageSource: TokenTotals]
+    let topProjects: [LedgerProjectUsage]
+
+    private var sortedSources: [(source: UsageSource, totals: TokenTotals)] {
+        bySource
+            .map { (source: $0.key, totals: $0.value) }
+            .sorted { $0.totals.costUSD > $1.totals.costUSD }
+    }
+
+    private var totalCost: Double {
+        max(0.01, bySource.values.reduce(0) { $0 + $1.costUSD })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Image(systemName: "square.grid.2x2.fill")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.cyan)
+                Text("By App (30 Days)")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.white)
+                Spacer()
+            }
+
+            VStack(spacing: 10) {
+                ForEach(sortedSources, id: \.source) { item in
+                    sourceRow(item.source, totals: item.totals)
+                }
+            }
+
+            if !topProjects.isEmpty {
+                Divider()
+                    .overlay(Color.white.opacity(0.08))
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("TOP PROJECTS")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.4))
+
+                    ForEach(topProjects, id: \.path) { project in
+                        HStack {
+                            Image(systemName: "folder.fill")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.white.opacity(0.35))
+                            Text(project.displayName)
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.8))
+                                .lineLimit(1)
+                            Spacer()
+                            Text(Self.formatTokens(project.totals.totalTokens))
+                                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                                .foregroundStyle(.white.opacity(0.6))
+                            Text(String(format: "$%.0f", project.totals.costUSD))
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.green.opacity(0.9))
+                                .frame(width: 44, alignment: .trailing)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .background {
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color(red: 0.10, green: 0.08, blue: 0.22))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 16)
+                        .stroke(.white.opacity(0.12), lineWidth: 1)
+                }
+        }
+    }
+
+    private func sourceRow(_ source: UsageSource, totals: TokenTotals) -> some View {
+        VStack(spacing: 4) {
+            HStack {
+                Image(systemName: source == .claudeDesktop ? "macwindow" : "terminal.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(self.color(for: source))
+                Text(source.displayName)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.9))
+                Spacer()
+                Text(Self.formatTokens(totals.totalTokens))
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.6))
+                Text(String(format: "$%.2f", totals.costUSD))
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(.green)
+                    .frame(width: 62, alignment: .trailing)
+            }
+
+            GeometryReader { geometry in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(.white.opacity(0.08))
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(self.color(for: source))
+                        .frame(width: geometry.size.width * (totals.costUSD / totalCost))
+                }
+            }
+            .frame(height: 4)
+        }
+    }
+
+    private func color(for source: UsageSource) -> Color {
+        switch source {
+        case .claudeDesktop: .purple
+        case .claudeCode: .cyan
+        case .probe: .gray
+        }
+    }
+
+    private static func formatTokens(_ count: Int) -> String {
+        if count >= 1_000_000_000 { return String(format: "%.2fB", Double(count) / 1_000_000_000) }
+        if count >= 1_000_000 { return String(format: "%.1fM", Double(count) / 1_000_000) }
+        if count >= 1_000 { return String(format: "%.0fK", Double(count) / 1_000) }
+        return "\(count)"
+    }
+}
+
 // MARK: - Preview
 
 #Preview {
     PremiumDashboardView(
         usageStore: UsageStore(),
         settingsStore: SettingsStore(),
+        ledgerStore: TokenLedgerStore(),
         onRefresh: {},
         onSettings: {},
         onQuit: {}

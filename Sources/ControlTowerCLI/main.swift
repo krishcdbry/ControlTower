@@ -15,6 +15,8 @@ struct ControlTowerCLI {
         switch command {
         case "status", "s":
             await Self.showStatus()
+        case "tokens", "t":
+            await Self.showTokens(arguments: Array(arguments.dropFirst()))
         case "list", "l":
             Self.listProviders()
         case "version", "-v", "--version":
@@ -78,6 +80,79 @@ struct ControlTowerCLI {
         }
     }
 
+    static func showTokens(arguments: [String]) async {
+        let started = Date()
+        let snapshot = await TokenLedger.shared.snapshot(forceScan: true)
+        let elapsed = Date().timeIntervalSince(started)
+
+        func fmt(_ tokens: Int) -> String {
+            if tokens >= 1_000_000_000 { return String(format: "%.2fB", Double(tokens) / 1_000_000_000) }
+            if tokens >= 1_000_000 { return String(format: "%.1fM", Double(tokens) / 1_000_000) }
+            if tokens >= 1_000 { return String(format: "%.1fK", Double(tokens) / 1_000) }
+            return "\(tokens)"
+        }
+        func money(_ value: Double) -> String { String(format: "$%.2f", value) }
+        func row(_ label: String, _ totals: TokenTotals) {
+            let padded = label.padding(toLength: 14, withPad: " ", startingAt: 0)
+            print("  \(padded) \(fmt(totals.totalTokens).padding(toLength: 10, withPad: " ", startingAt: 0)) \(money(totals.costUSD).padding(toLength: 10, withPad: " ", startingAt: 0)) (in \(fmt(totals.inputTokens)) / out \(fmt(totals.outputTokens)) / cache r \(fmt(totals.cacheReadTokens)) w \(fmt(totals.cacheWriteTokens)))")
+        }
+
+        print("Claude Token Ledger")
+        print("===================")
+        print()
+        print("  Period         Tokens     Cost       Breakdown")
+        row("Today", snapshot.today)
+        row("Last 7 days", snapshot.last7Days)
+        row("Last 30 days", snapshot.last30Days)
+
+        if !snapshot.bySource.isEmpty {
+            print()
+            print("By app (30d):")
+            for (source, totals) in snapshot.bySource.sorted(by: { $0.value.costUSD > $1.value.costUSD }) {
+                row(source.displayName, totals)
+            }
+        }
+
+        if !snapshot.byModel.isEmpty {
+            print()
+            print("By model (30d):")
+            for (model, totals) in snapshot.byModel.sorted(by: { $0.value.costUSD > $1.value.costUSD }) {
+                row(model, totals)
+            }
+        }
+
+        if !snapshot.byProject.isEmpty {
+            print()
+            print("Top projects (30d):")
+            for project in snapshot.byProject.prefix(5) {
+                row(project.displayName, project.totals)
+            }
+        }
+
+        if let block = snapshot.currentBlock {
+            print()
+            print("Current 5h block (started \(Self.timeFormatter.string(from: block.start))):")
+            print("  Tokens: \(fmt(block.totals.totalTokens))  Cost: \(money(block.totals.costUSD))  Burn: \(fmt(Int(block.burnRate())))/min  Resets in: \(block.remainingDescription())")
+        } else {
+            print()
+            print("No active 5h block.")
+        }
+
+        let stats = snapshot.stats
+        print()
+        print(String(format: "Scan: %d files seen, %d parsed, %.1f MB read, %d entries added in %.2fs (total %.2fs)%@",
+                     stats.filesSeen, stats.filesParsed,
+                     Double(stats.bytesParsed) / 1_048_576,
+                     stats.entriesAdded, stats.duration, elapsed,
+                     stats.isInitialScan ? " [initial index]" : ""))
+    }
+
+    private static let timeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
+
     static func listProviders() {
         print("Supported Providers:")
         print()
@@ -101,12 +176,14 @@ struct ControlTowerCLI {
 
         COMMANDS:
             status, s       Show usage status for all providers
+            tokens, t       Show Claude token usage and costs (all apps)
             list, l         List supported providers
             version, -v     Print version information
             help, -h        Show this help message
 
         EXAMPLES:
             ct status
+            ct tokens
             ct list
 
         """)

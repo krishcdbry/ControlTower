@@ -11,20 +11,26 @@ final class StatusItemController: NSObject {
     private let settingsStore: SettingsStore
     private let usageStore: UsageStore
     private let accountStore: AccountStore
+    private let ledgerStore: TokenLedgerStore
 
     private var popover: NSPopover?
     private var eventMonitor: Any?
+    private var tooltipTimer: Timer?
+    private var cachedCustomIcon: NSImage?
+    private var didLoadCustomIcon = false
 
     // MARK: - Initialization
 
     init(
         settingsStore: SettingsStore,
         usageStore: UsageStore,
-        accountStore: AccountStore
+        accountStore: AccountStore,
+        ledgerStore: TokenLedgerStore
     ) {
         self.settingsStore = settingsStore
         self.usageStore = usageStore
         self.accountStore = accountStore
+        self.ledgerStore = ledgerStore
 
         // Create status item
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -33,6 +39,13 @@ final class StatusItemController: NSObject {
 
         self.setupStatusItem()
         self.setupObservation()
+    }
+
+    isolated deinit {
+        self.tooltipTimer?.invalidate()
+        if let monitor = self.eventMonitor {
+            NSEvent.removeMonitor(monitor)
+        }
     }
 
     // MARK: - Setup
@@ -50,11 +63,27 @@ final class StatusItemController: NSObject {
     }
 
     private func setupObservation() {
-        // Observe usage store changes
-        Task { @MainActor [weak self] in
-            while true {
+        // Update the icon when usage data changes (re-arming observation each time).
+        self.observeUsageChanges()
+
+        // Low-frequency tick keeps the relative "Updated Xm ago" tooltip fresh.
+        self.tooltipTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
                 self?.updateIcon()
-                try? await Task.sleep(for: .seconds(1))
+            }
+        }
+    }
+
+    private func observeUsageChanges() {
+        withObservationTracking {
+            _ = self.usageStore.snapshots
+            _ = self.usageStore.errors
+            _ = self.settingsStore.enabledProviders
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.updateIcon()
+                self.observeUsageChanges()
             }
         }
     }
@@ -106,16 +135,20 @@ final class StatusItemController: NSObject {
     }
 
     private func loadMenuBarIcon() -> NSImage? {
-        // Try to load custom menu bar icon template
+        // Load the custom icon once; updateIcon runs frequently and must not hit disk.
+        if self.didLoadCustomIcon {
+            return self.cachedCustomIcon
+        }
+        self.didLoadCustomIcon = true
+
         if let url = Bundle.moduleResources.url(forResource: "menubar-icon", withExtension: "png"),
            let image = NSImage(contentsOf: url) {
-            return image
+            self.cachedCustomIcon = image
+        } else if let url = Bundle.main.url(forResource: "menubar-icon", withExtension: "png"),
+                  let image = NSImage(contentsOf: url) {
+            self.cachedCustomIcon = image
         }
-        if let url = Bundle.main.url(forResource: "menubar-icon", withExtension: "png"),
-           let image = NSImage(contentsOf: url) {
-            return image
-        }
-        return nil
+        return self.cachedCustomIcon
     }
 
     private func tintedImage(_ image: NSImage, color: NSColor) -> NSImage {
@@ -181,36 +214,49 @@ final class StatusItemController: NSObject {
     private func showPopover() {
         guard let button = statusItem.button else { return }
 
-        // Always recreate popover for fresh state
-        let newPopover = NSPopover()
-        newPopover.behavior = .transient
-        newPopover.animates = true
+        // Reuse the popover; data flows from the observable stores, so the
+        // content stays current without rebuilding the view hierarchy.
+        let popover: NSPopover
+        if let existing = self.popover {
+            popover = existing
+        } else {
+            popover = NSPopover()
+            popover.behavior = .transient
+            popover.animates = true
+            popover.delegate = self
 
-        // Use the new premium dashboard view
-        let contentView = PremiumDashboardView(
-            usageStore: self.usageStore,
-            settingsStore: self.settingsStore,
-            onRefresh: { [weak self] in
-                Task { await self?.usageStore.refresh() }
-            },
-            onSettings: { [weak self] in
-                self?.popover?.close()
-                self?.openSettings()
-            },
-            onQuit: { [weak self] in
-                self?.popover?.close()
-                NSApp.terminate(nil)
-            }
-        )
+            let contentView = PremiumDashboardView(
+                usageStore: self.usageStore,
+                settingsStore: self.settingsStore,
+                ledgerStore: self.ledgerStore,
+                onRefresh: { [weak self] in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.ledgerStore.refresh(force: true)
+                        await self.usageStore.refresh()
+                    }
+                },
+                onSettings: { [weak self] in
+                    self?.popover?.close()
+                    self?.openSettings()
+                },
+                onQuit: { [weak self] in
+                    self?.popover?.close()
+                    NSApp.terminate(nil)
+                }
+            )
 
-        let hostingController = NSHostingController(rootView: contentView)
-        // Let SwiftUI determine the size
-        hostingController.sizingOptions = [.preferredContentSize]
-        newPopover.contentViewController = hostingController
-        self.popover = newPopover
+            let hostingController = NSHostingController(rootView: contentView)
+            // Let SwiftUI determine the size
+            hostingController.sizingOptions = [.preferredContentSize]
+            popover.contentViewController = hostingController
+            self.popover = popover
+        }
 
-        // Show popover
-        popover?.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        // Refresh token data when opening (incremental; typically a few ms).
+        self.ledgerStore.refresh()
+
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
 
         // Setup event monitor to close on click outside
         self.setupEventMonitor()
@@ -294,6 +340,16 @@ final class StatusItemController: NSObject {
 
     @objc private func quitApp() {
         NSApp.terminate(nil)
+    }
+}
+
+// MARK: - NSPopoverDelegate
+
+extension StatusItemController: NSPopoverDelegate {
+    func popoverDidClose(_ notification: Notification) {
+        // The popover can close transiently (click outside) or programmatically;
+        // always tear down the global event monitor so they don't accumulate.
+        self.removeEventMonitor()
     }
 }
 
