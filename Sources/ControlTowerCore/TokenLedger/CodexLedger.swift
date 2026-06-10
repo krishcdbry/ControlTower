@@ -41,7 +41,7 @@ public actor CodexLedger {
     private var cachedSnapshot: CodexLedgerSnapshot?
     private var lastScanAt: Date?
     private let minScanInterval: TimeInterval = 5
-    private let historyCutoffDays = 35
+    private let historyCutoffDays = 190
     private let windowDays = 30
 
     public init(storeURL: URL? = nil) {

@@ -366,6 +366,73 @@ struct LedgerBlockTests {
     }
 }
 
+// MARK: - Day detail
+
+@Suite("LedgerDayDetail Tests")
+struct LedgerDayDetailTests {
+    @Test("parseDayKey round-trips with dayKey")
+    func parseDayKeyRoundTrip() throws {
+        var calendar = Calendar.current
+        calendar.timeZone = TimeZone.current
+        let date = try #require(TokenLedger.parseDayKey("2026-06-10"))
+        #expect(TokenLedger.dayKey(for: date, calendar: calendar) == "2026-06-10")
+        #expect(TokenLedger.parseDayKey("garbage") == nil)
+        #expect(TokenLedger.parseDayKey("2026-13") == nil)
+    }
+
+    @Test("dayDetail aggregates models, sources, projects, and hours")
+    func dayDetailAggregation() async throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ledger-detail-\(UUID().uuidString).sqlite")
+        let store = try LedgerStore(url: url)
+
+        var calendar = Calendar.current
+        calendar.timeZone = TimeZone.current
+        let dayStart = try #require(TokenLedger.parseDayKey("2026-06-09"))
+        let hour9 = Int64(dayStart.addingTimeInterval(9 * 3600).timeIntervalSince1970)
+        let hour14 = Int64(dayStart.addingTimeInterval(14 * 3600).timeIntervalSince1970)
+
+        func entry(hour: Int64, model: String, output: Int) -> ParsedUsageEntry {
+            ParsedUsageEntry(
+                dedupKey: nil, hourStart: hour, model: model,
+                inputTokens: 100, outputTokens: output,
+                cacheReadTokens: 0, cacheWrite5mTokens: 0, cacheWrite1hTokens: 0
+            )
+        }
+
+        try store.commit(
+            path: "/a.jsonl", source: "code", project: "/Users/dev/alpha",
+            entries: [entry(hour: hour9, model: "claude-opus-4-7", output: 50)],
+            size: 1, mtime: 1, offset: 1
+        )
+        try store.commit(
+            path: "/b.jsonl", source: "desktop", project: "/Users/dev/beta",
+            entries: [entry(hour: hour14, model: "claude-sonnet-4-6", output: 30)],
+            size: 1, mtime: 1, offset: 1
+        )
+        // Probe usage must be excluded.
+        try store.commit(
+            path: "/probe.jsonl", source: "probe", project: "",
+            entries: [entry(hour: hour9, model: "claude-opus-4-7", output: 999)],
+            size: 1, mtime: 1, offset: 1
+        )
+
+        let ledger = TokenLedger(storeURL: url)
+        let detail = try #require(await ledger.dayDetail(date: "2026-06-09"))
+
+        #expect(detail.totals.outputTokens == 80)
+        #expect(detail.byModel.count == 2)
+        #expect(detail.bySource[.claudeCode]?.outputTokens == 50)
+        #expect(detail.bySource[.claudeDesktop]?.outputTokens == 30)
+        #expect(detail.byProject.count == 2)
+        #expect(detail.byHour[9]?.outputTokens == 50)
+        #expect(detail.byHour[14]?.outputTokens == 30)
+
+        // A day with no rows returns nil.
+        #expect(await ledger.dayDetail(date: "2025-01-01") == nil)
+    }
+}
+
 // MARK: - Desktop catalog
 
 @Suite("DesktopSessionCatalog Tests")

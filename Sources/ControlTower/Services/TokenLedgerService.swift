@@ -41,6 +41,11 @@ final class TokenLedgerStore {
         self.refresh(force: force)
         await self.refreshTask?.value
     }
+
+    /// Drill-down for one heatmap day.
+    func dayDetail(_ date: String) async -> LedgerDayDetail? {
+        await TokenLedger.shared.dayDetail(date: date)
+    }
 }
 
 // MARK: - Transcript Watcher (FSEvents)

@@ -104,6 +104,15 @@ final class LedgerStore: Sendable {
             }
         }
 
+        // v3: history window widened from 35 to 190 days for the activity
+        // heatmap. Files outside the old window were cursor-marked without
+        // parsing, so a one-time full re-index is required.
+        migrator.registerMigration("ledger_v3_reindex_history") { db in
+            try db.execute(sql: "DELETE FROM usage_hours")
+            try db.execute(sql: "DELETE FROM dedup_keys")
+            try db.execute(sql: "DELETE FROM file_cursor")
+        }
+
         try migrator.migrate(self.dbQueue)
     }
 

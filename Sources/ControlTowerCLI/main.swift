@@ -142,6 +142,12 @@ struct ControlTowerCLI {
             print("No active 5h block.")
         }
 
+        if let first = snapshot.dailyActivity.first {
+            let active = snapshot.dailyActivity.filter { $0.totalTokens > 0 }.count
+            print()
+            print("Activity: \(active) active days since \(first.date)")
+        }
+
         let stats = snapshot.stats
         print()
         print(String(format: "Scan: %d files seen, %d parsed, %.1f MB read, %d entries added in %.2fs (total %.2fs)%@",

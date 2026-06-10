@@ -12,10 +12,13 @@ struct PremiumDashboardView: View {
     let onRefresh: () -> Void
     let onSettings: () -> Void
     let onQuit: () -> Void
+    var onClose: () -> Void = {}
 
     @State private var selectedProvider: ProviderID?
     @State private var codexCostSnapshot: CodexCostScanner.CostSnapshot?
     @State private var isLoadingCost = false
+    @State private var selectedHeatDay: String?
+    @State private var heatDayDetail: LedgerDayDetail?
 
     private var enabledProviders: [ProviderID] {
         ProviderID.allCases.filter { settingsStore.enabledProviders.contains($0) }
@@ -61,6 +64,16 @@ struct PremiumDashboardView: View {
         .onChange(of: selectedProvider) { _, newProvider in
             // Load provider-specific cost data when selected
             Task { await loadProviderCostData(newProvider) }
+        }
+        .task(id: selectedHeatDay) {
+            guard let day = selectedHeatDay else {
+                heatDayDetail = nil
+                return
+            }
+            heatDayDetail = await ledgerStore.dayDetail(day)
+        }
+        .onExitCommand {
+            onClose()
         }
     }
 
@@ -250,6 +263,25 @@ struct PremiumDashboardView: View {
                             bySource: ledger.bySource,
                             topProjects: Array(ledger.byProject.prefix(3))
                         )
+                    }
+
+                    // Activity heatmap with per-day drill-down.
+                    if !ledger.dailyActivity.isEmpty {
+                        GlassHeatmapCard(
+                            activity: ledger.dailyActivity,
+                            selectedDay: $selectedHeatDay
+                        )
+                        if let day = selectedHeatDay {
+                            if let detail = heatDayDetail {
+                                GlassDayDetailCard(detail: detail) {
+                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                                        selectedHeatDay = nil
+                                    }
+                                }
+                            } else {
+                                GlassDayDetailLoading(date: day)
+                            }
+                        }
                     }
 
                     if ledger.stats.isInitialScan {
@@ -1839,6 +1871,418 @@ struct GlassSourceBreakdownCard: View {
     }
 }
 
+// MARK: - Activity Heatmap Card
+
+/// GitHub-style activity heatmap: ~6 months of daily usage in week columns.
+/// Tapping a day with activity opens the drill-down panel.
+struct GlassHeatmapCard: View {
+    let activity: [LedgerActivityDay]
+    @Binding var selectedDay: String?
+
+    private static let weekCount = 25
+    private static let cellSize: CGFloat = 10
+    private static let cellGap: CGFloat = 3
+
+    private struct HeatCell: Identifiable {
+        let id: String // day key
+        let date: Date
+        let tokens: Int
+        let level: Int // 0-4
+        let isFuture: Bool
+    }
+
+    private struct WeekColumn: Identifiable {
+        let id: Int
+        let monthLabel: String?
+        let cells: [HeatCell]
+    }
+
+    private var tokensByDay: [String: Int] {
+        Dictionary(uniqueKeysWithValues: activity.map { ($0.date, $0.totalTokens) })
+    }
+
+    /// Quartile thresholds over non-zero days drive the color levels.
+    private var thresholds: [Int] {
+        let values = activity.map(\.totalTokens).filter { $0 > 0 }.sorted()
+        guard !values.isEmpty else { return [1, 2, 3, 4] }
+        func quantile(_ q: Double) -> Int {
+            values[min(values.count - 1, Int(Double(values.count) * q))]
+        }
+        return [max(1, quantile(0.25)), quantile(0.5), quantile(0.75), quantile(0.92)]
+    }
+
+    private var weeks: [WeekColumn] {
+        var calendar = Calendar.current
+        calendar.firstWeekday = 2 // weeks start Monday
+        let today = calendar.startOfDay(for: Date())
+        guard let currentWeekStart = calendar.dateInterval(of: .weekOfYear, for: today)?.start else { return [] }
+
+        let byDay = self.tokensByDay
+        let levels = self.thresholds
+        var columns: [WeekColumn] = []
+        var previousMonth = -1
+
+        for weekIndex in stride(from: Self.weekCount - 1, through: 0, by: -1) {
+            guard let weekStart = calendar.date(byAdding: .weekOfYear, value: -weekIndex, to: currentWeekStart) else { continue }
+
+            var cells: [HeatCell] = []
+            for dayOffset in 0..<7 {
+                guard let date = calendar.date(byAdding: .day, value: dayOffset, to: weekStart) else { continue }
+                let key = TokenLedger.dayKey(for: date, calendar: calendar)
+                let tokens = byDay[key] ?? 0
+                let level: Int = {
+                    guard tokens > 0 else { return 0 }
+                    if tokens >= levels[3] { return 4 }
+                    if tokens >= levels[2] { return 3 }
+                    if tokens >= levels[1] { return 2 }
+                    return 1
+                }()
+                cells.append(HeatCell(id: key, date: date, tokens: tokens, level: level, isFuture: date > today))
+            }
+
+            let month = calendar.component(.month, from: weekStart)
+            var label: String?
+            if month != previousMonth {
+                label = Self.monthFormatter.string(from: weekStart)
+                previousMonth = month
+            }
+            columns.append(WeekColumn(id: columns.count, monthLabel: label, cells: cells))
+        }
+        return columns
+    }
+
+    var body: some View {
+        let columns = self.weeks
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: "calendar")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.purple)
+                Text("Activity")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.white)
+                Text("6 months")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.white.opacity(0.4))
+                Spacer()
+                legend
+            }
+
+            HStack(alignment: .top, spacing: 6) {
+                // Weekday gutter
+                VStack(alignment: .trailing, spacing: Self.cellGap) {
+                    ForEach(0..<7, id: \.self) { row in
+                        Text(row == 0 ? "Mon" : row == 2 ? "Wed" : row == 4 ? "Fri" : "")
+                            .font(.system(size: 7.5))
+                            .foregroundStyle(.white.opacity(0.35))
+                            .frame(width: 22, height: Self.cellSize, alignment: .trailing)
+                    }
+                }
+                .padding(.top, 13)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    // Month labels positioned over their columns.
+                    ZStack(alignment: .topLeading) {
+                        Color.clear.frame(height: 10)
+                        ForEach(columns) { week in
+                            if let label = week.monthLabel {
+                                Text(label)
+                                    .font(.system(size: 8, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.45))
+                                    .fixedSize()
+                                    .offset(x: CGFloat(week.id) * (Self.cellSize + Self.cellGap))
+                            }
+                        }
+                    }
+
+                    HStack(alignment: .top, spacing: Self.cellGap) {
+                        ForEach(columns) { week in
+                            VStack(spacing: Self.cellGap) {
+                                ForEach(week.cells) { cell in
+                                    heatCell(cell)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .background {
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color(red: 0.10, green: 0.08, blue: 0.22))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 16)
+                        .stroke(.white.opacity(0.12), lineWidth: 1)
+                }
+        }
+    }
+
+    @ViewBuilder
+    private func heatCell(_ cell: HeatCell) -> some View {
+        let isSelected = selectedDay == cell.id
+        if cell.isFuture {
+            RoundedRectangle(cornerRadius: 2.5)
+                .fill(Color.clear)
+                .frame(width: Self.cellSize, height: Self.cellSize)
+        } else {
+            Button {
+                guard cell.tokens > 0 else { return }
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                    selectedDay = isSelected ? nil : cell.id
+                }
+            } label: {
+                RoundedRectangle(cornerRadius: 2.5)
+                    .fill(Self.color(for: cell.level))
+                    .frame(width: Self.cellSize, height: Self.cellSize)
+                    .overlay {
+                        if isSelected {
+                            RoundedRectangle(cornerRadius: 2.5)
+                                .stroke(.white, lineWidth: 1.5)
+                        }
+                    }
+            }
+            .buttonStyle(.plain)
+            .help("\(cell.id): \(Self.formatTokens(cell.tokens)) tokens")
+        }
+    }
+
+    private var legend: some View {
+        HStack(spacing: 3) {
+            Text("Less")
+                .font(.system(size: 8.5))
+                .foregroundStyle(.white.opacity(0.35))
+            ForEach(0..<5, id: \.self) { level in
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Self.color(for: level))
+                    .frame(width: 8, height: 8)
+            }
+            Text("More")
+                .font(.system(size: 8.5))
+                .foregroundStyle(.white.opacity(0.35))
+        }
+    }
+
+    private static func color(for level: Int) -> Color {
+        switch level {
+        case 1: Color(red: 0.29, green: 0.24, blue: 0.55)
+        case 2: Color(red: 0.42, green: 0.35, blue: 0.78)
+        case 3: Color(red: 0.55, green: 0.49, blue: 1.0)
+        case 4: Color(red: 0.75, green: 0.70, blue: 1.0)
+        default: Color.white.opacity(0.07)
+        }
+    }
+
+    private static func formatTokens(_ count: Int) -> String {
+        if count >= 1_000_000_000 { return String(format: "%.2fB", Double(count) / 1_000_000_000) }
+        if count >= 1_000_000 { return String(format: "%.1fM", Double(count) / 1_000_000) }
+        if count >= 1_000 { return String(format: "%.0fK", Double(count) / 1_000) }
+        return "\(count)"
+    }
+
+    private static let monthFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM"
+        return formatter
+    }()
+}
+
+// MARK: - Day Detail Card
+
+/// Drill-down for a heatmap day: totals, hourly distribution, models,
+/// apps, and projects.
+struct GlassDayDetailCard: View {
+    let detail: LedgerDayDetail
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 13) {
+            HStack {
+                Text(Self.displayDate(detail.date))
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.white)
+                Spacer()
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 15))
+                        .foregroundStyle(.white.opacity(0.35))
+                }
+                .buttonStyle(.plain)
+            }
+
+            // Headline stats
+            HStack(spacing: 14) {
+                stat(Self.formatTokens(detail.totals.totalTokens), "Tokens")
+                divider
+                stat(String(format: "$%.2f", detail.totals.costUSD), "Cost", color: .green)
+                divider
+                stat("\(detail.totals.entryCount)", "Messages")
+                divider
+                stat("\(detail.byModel.count)", "Models")
+            }
+
+            // Hourly distribution
+            hourChart
+
+            // Models
+            if !detail.byModel.isEmpty {
+                breakdownRows(
+                    title: "MODELS",
+                    rows: detail.byModel
+                        .sorted { $0.value.costUSD > $1.value.costUSD }
+                        .prefix(3)
+                        .map { (label: Self.shortModel($0.key), totals: $0.value) }
+                )
+            }
+
+            // Apps
+            if !detail.bySource.isEmpty {
+                breakdownRows(
+                    title: "APPS",
+                    rows: detail.bySource
+                        .sorted { $0.value.costUSD > $1.value.costUSD }
+                        .map { (label: $0.key.displayName, totals: $0.value) }
+                )
+            }
+
+            // Projects
+            if !detail.byProject.isEmpty {
+                breakdownRows(
+                    title: "PROJECTS",
+                    rows: detail.byProject.prefix(3).map { (label: $0.displayName, totals: $0.totals) }
+                )
+            }
+        }
+        .padding(16)
+        .background {
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color(red: 0.12, green: 0.09, blue: 0.26))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 16)
+                        .stroke(Color(red: 0.55, green: 0.49, blue: 1.0).opacity(0.35), lineWidth: 1)
+                }
+        }
+        .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+
+    private var divider: some View {
+        Divider().frame(height: 24).overlay(Color.white.opacity(0.1))
+    }
+
+    private func stat(_ value: String, _ label: String, color: Color = .white) -> some View {
+        VStack(spacing: 2) {
+            Text(value)
+                .font(.system(size: 13.5, weight: .bold, design: .rounded))
+                .foregroundStyle(color)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            Text(label)
+                .font(.system(size: 9))
+                .foregroundStyle(.white.opacity(0.45))
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var hourChart: some View {
+        let maxTokens = max(1, detail.byHour.values.map(\.totalTokens).max() ?? 1)
+        return VStack(alignment: .leading, spacing: 4) {
+            Text("BY HOUR")
+                .font(.system(size: 8.5, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.35))
+            HStack(alignment: .bottom, spacing: 2.5) {
+                ForEach(0..<24, id: \.self) { hour in
+                    let tokens = detail.byHour[hour]?.totalTokens ?? 0
+                    RoundedRectangle(cornerRadius: 1.5)
+                        .fill(
+                            tokens > 0
+                                ? Color(red: 0.55, green: 0.49, blue: 1.0)
+                                : Color.white.opacity(0.08)
+                        )
+                        .frame(height: max(3, 30 * CGFloat(tokens) / CGFloat(maxTokens)))
+                        .frame(maxWidth: .infinity)
+                        .help(tokens > 0 ? "\(hour):00 — \(Self.formatTokens(tokens)) tokens" : "\(hour):00")
+                }
+            }
+            .frame(height: 32, alignment: .bottom)
+            HStack {
+                Text("12am").font(.system(size: 7.5)).foregroundStyle(.white.opacity(0.3))
+                Spacer()
+                Text("12pm").font(.system(size: 7.5)).foregroundStyle(.white.opacity(0.3))
+                Spacer()
+                Text("11pm").font(.system(size: 7.5)).foregroundStyle(.white.opacity(0.3))
+            }
+        }
+    }
+
+    private func breakdownRows(title: String, rows: [(label: String, totals: TokenTotals)]) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.system(size: 8.5, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.35))
+            ForEach(rows, id: \.label) { row in
+                HStack {
+                    Text(row.label)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .lineLimit(1)
+                    Spacer()
+                    Text(Self.formatTokens(row.totals.totalTokens))
+                        .font(.system(size: 11, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.55))
+                    Text(String(format: "$%.2f", row.totals.costUSD))
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.green.opacity(0.9))
+                        .frame(width: 56, alignment: .trailing)
+                }
+            }
+        }
+    }
+
+    static func shortModel(_ model: String) -> String {
+        model.replacingOccurrences(of: "claude-", with: "")
+    }
+
+    static func displayDate(_ key: String) -> String {
+        guard let date = TokenLedger.parseDayKey(key) else { return key }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "EEEE, MMM d"
+        return formatter.string(from: date)
+    }
+
+    private static func formatTokens(_ count: Int) -> String {
+        if count >= 1_000_000_000 { return String(format: "%.2fB", Double(count) / 1_000_000_000) }
+        if count >= 1_000_000 { return String(format: "%.1fM", Double(count) / 1_000_000) }
+        if count >= 1_000 { return String(format: "%.0fK", Double(count) / 1_000) }
+        return "\(count)"
+    }
+}
+
+/// Placeholder while a day's drill-down loads.
+struct GlassDayDetailLoading: View {
+    let date: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .scaleEffect(0.55)
+                .tint(.white.opacity(0.6))
+            Text(GlassDayDetailCard.displayDate(date))
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(.white.opacity(0.6))
+            Spacer()
+        }
+        .padding(14)
+        .background {
+            RoundedRectangle(cornerRadius: 16)
+                .fill(Color(red: 0.12, green: 0.09, blue: 0.26))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 16)
+                        .stroke(.white.opacity(0.1), lineWidth: 1)
+                }
+        }
+    }
+}
+
 // MARK: - Preview
 
 #Preview {
@@ -1848,6 +2292,7 @@ struct GlassSourceBreakdownCard: View {
         ledgerStore: TokenLedgerStore(),
         onRefresh: {},
         onSettings: {},
-        onQuit: {}
+        onQuit: {},
+        onClose: {}
     )
 }

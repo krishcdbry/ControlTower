@@ -156,6 +156,47 @@ public struct LedgerProjectUsage: Sendable, Equatable {
     }
 }
 
+/// One day of activity for the heatmap (lightweight, long window).
+public struct LedgerActivityDay: Sendable, Equatable {
+    /// Local day key, "yyyy-MM-dd".
+    public let date: String
+    public let totalTokens: Int
+    public let costUSD: Double
+
+    public init(date: String, totalTokens: Int, costUSD: Double) {
+        self.date = date
+        self.totalTokens = totalTokens
+        self.costUSD = costUSD
+    }
+}
+
+/// Full drill-down for a single day (heatmap selection).
+public struct LedgerDayDetail: Sendable, Equatable {
+    public let date: String
+    public let totals: TokenTotals
+    public let byModel: [String: TokenTotals]
+    public let bySource: [UsageSource: TokenTotals]
+    public let byProject: [LedgerProjectUsage]
+    /// Local hour of day (0–23) -> totals.
+    public let byHour: [Int: TokenTotals]
+
+    public init(
+        date: String,
+        totals: TokenTotals,
+        byModel: [String: TokenTotals],
+        bySource: [UsageSource: TokenTotals],
+        byProject: [LedgerProjectUsage],
+        byHour: [Int: TokenTotals]
+    ) {
+        self.date = date
+        self.totals = totals
+        self.byModel = byModel
+        self.bySource = bySource
+        self.byProject = byProject
+        self.byHour = byHour
+    }
+}
+
 /// Statistics about the most recent scan.
 public struct LedgerScanStats: Sendable, Equatable {
     public let filesSeen: Int
@@ -202,6 +243,8 @@ public struct LedgerSnapshot: Sendable {
     public let currentBlock: LedgerBlock?
     /// Most recent blocks (including the active one), newest last. Capped.
     public let recentBlocks: [LedgerBlock]
+    /// Daily activity for the heatmap (~6 months), ascending by date.
+    public let dailyActivity: [LedgerActivityDay]
     public let stats: LedgerScanStats
 
     public init(
@@ -215,6 +258,7 @@ public struct LedgerSnapshot: Sendable {
         byProject: [LedgerProjectUsage] = [],
         currentBlock: LedgerBlock? = nil,
         recentBlocks: [LedgerBlock] = [],
+        dailyActivity: [LedgerActivityDay] = [],
         stats: LedgerScanStats = LedgerScanStats()
     ) {
         self.generatedAt = generatedAt
@@ -227,6 +271,7 @@ public struct LedgerSnapshot: Sendable {
         self.byProject = byProject
         self.currentBlock = currentBlock
         self.recentBlocks = recentBlocks
+        self.dailyActivity = dailyActivity
         self.stats = stats
     }
 }

@@ -24,9 +24,11 @@ public actor TokenLedger {
     /// Files whose mtime is older than this never contain entries inside the
     /// reporting window (transcripts are append-only), so they are cursor-marked
     /// without parsing. Keeps cold start proportional to recent activity.
-    private let historyCutoffDays = 35
+    private let historyCutoffDays = 190
     /// Reporting window for snapshot aggregates.
     private let windowDays = 30
+    /// Window for the daily-activity heatmap (~26 weeks).
+    private let activityDays = 183
 
     private var desktopSessionIDs: Set<String> = []
     private var desktopCatalogLoadedAt: Date?
@@ -196,16 +198,19 @@ public actor TokenLedger {
 
     private func buildSnapshot(store: LedgerStore, stats: LedgerScanStats, now: Date) throws -> LedgerSnapshot {
         // One extra day of lookback so local-timezone day bucketing is complete.
-        let since = Int64(now.timeIntervalSince1970) - Int64(self.windowDays + 1) * 86400
+        let since = Int64(now.timeIntervalSince1970) - Int64(self.activityDays + 1) * 86400
         let rows = try store.hourRows(since: since)
 
         var calendar = Calendar.current
         calendar.timeZone = TimeZone.current
 
-        // Local day keys for the reporting window.
+        // Local day keys for the reporting windows.
         let todayKey = Self.dayKey(for: now, calendar: calendar)
         let last7Start = Self.dayKey(for: now.addingTimeInterval(-6 * 86400), calendar: calendar)
         let last30Start = Self.dayKey(for: now.addingTimeInterval(-Double(self.windowDays - 1) * 86400), calendar: calendar)
+        let activityStart = Self.dayKey(for: now.addingTimeInterval(-Double(self.activityDays - 1) * 86400), calendar: calendar)
+        // Blocks only need recent history; keep their bucket set small.
+        let blockSince = Int64(now.timeIntervalSince1970) - 3 * 86400
 
         var dayKeyCache: [Int64: String] = [:]
 
@@ -215,6 +220,7 @@ public actor TokenLedger {
             var bySource: [UsageSource: TokenTotals] = [:]
         }
         var dayBuckets: [String: DayBucket] = [:]
+        var activityBuckets: [String: (tokens: Int, cost: Double)] = [:]
         var bySource: [UsageSource: TokenTotals] = [:]
         var byModel: [String: TokenTotals] = [:]
         var byProject: [String: TokenTotals] = [:]
@@ -255,7 +261,21 @@ public actor TokenLedger {
                 dayKey = Self.dayKey(for: Date(timeIntervalSince1970: TimeInterval(row.hourStart)), calendar: calendar)
                 dayKeyCache[row.hourStart] = dayKey
             }
-            guard dayKey >= last30Start, dayKey <= todayKey else { continue }
+            guard dayKey <= todayKey else { continue }
+
+            // Long-window heatmap aggregation.
+            if dayKey >= activityStart {
+                activityBuckets[dayKey, default: (0, 0)].tokens += totals.totalTokens
+                activityBuckets[dayKey]?.cost += cost
+            }
+
+            if row.hourStart >= blockSince {
+                hourBuckets[row.hourStart, default: HourBucket()].totals.add(totals)
+                hourBuckets[row.hourStart]?.byModel[row.model, default: .zero].add(totals)
+            }
+
+            // Everything below is the 30-day reporting window.
+            guard dayKey >= last30Start else { continue }
 
             dayBuckets[dayKey, default: DayBucket()].totals.add(totals)
             dayBuckets[dayKey]?.byModel[row.model, default: .zero].add(totals)
@@ -266,9 +286,6 @@ public actor TokenLedger {
             if !row.project.isEmpty {
                 byProject[row.project, default: .zero].add(totals)
             }
-
-            hourBuckets[row.hourStart, default: HourBucket()].totals.add(totals)
-            hourBuckets[row.hourStart]?.byModel[row.model, default: .zero].add(totals)
         }
 
         // Window totals.
@@ -282,6 +299,14 @@ public actor TokenLedger {
             last30.add(bucket.totals)
             if key >= last7Start { last7.add(bucket.totals) }
             if key == todayKey { today = bucket.totals }
+        }
+
+        let dailyActivity = activityBuckets.keys.sorted().map { key in
+            LedgerActivityDay(
+                date: key,
+                totalTokens: activityBuckets[key]?.tokens ?? 0,
+                costUSD: activityBuckets[key]?.cost ?? 0
+            )
         }
 
         // 5h blocks from hour buckets.
@@ -303,8 +328,100 @@ public actor TokenLedger {
             byProject: Array(projects.prefix(8)),
             currentBlock: currentBlock,
             recentBlocks: Array(blocks.suffix(12)),
+            dailyActivity: dailyActivity,
             stats: stats
         )
+    }
+
+    // MARK: - Day drill-down
+
+    /// Full breakdown for one local day ("yyyy-MM-dd"): models, sources,
+    /// projects, and hour-of-day distribution. Backed by the hour aggregates,
+    /// so it needs no file access.
+    public func dayDetail(date: String) async -> LedgerDayDetail? {
+        guard let store = try? self.openStore() else { return nil }
+        guard let dayStart = Self.parseDayKey(date) else { return nil }
+
+        var calendar = Calendar.current
+        calendar.timeZone = TimeZone.current
+
+        // Query with a day of slack on each side; filter by local day key.
+        let since = Int64(dayStart.timeIntervalSince1970) - 86400
+        guard let rows = try? store.hourRows(since: since) else { return nil }
+
+        var totals = TokenTotals.zero
+        var byModel: [String: TokenTotals] = [:]
+        var bySource: [UsageSource: TokenTotals] = [:]
+        var byProject: [String: TokenTotals] = [:]
+        var byHour: [Int: TokenTotals] = [:]
+        var matched = false
+
+        for row in rows {
+            let source = UsageSource(rawValue: row.source) ?? .claudeCode
+            guard source != .probe else { continue }
+
+            let rowDate = Date(timeIntervalSince1970: TimeInterval(row.hourStart))
+            guard Self.dayKey(for: rowDate, calendar: calendar) == date else { continue }
+            matched = true
+
+            let cost = ClaudePricing.cost(
+                model: row.model,
+                inputTokens: row.inputTokens,
+                outputTokens: row.outputTokens,
+                cacheReadTokens: row.cacheReadTokens,
+                cacheWrite5mTokens: row.cacheWrite5mTokens,
+                cacheWrite1hTokens: row.cacheWrite1hTokens
+            )
+            let rowTotals = TokenTotals(
+                inputTokens: row.inputTokens,
+                outputTokens: row.outputTokens,
+                cacheReadTokens: row.cacheReadTokens,
+                cacheWrite5mTokens: row.cacheWrite5mTokens,
+                cacheWrite1hTokens: row.cacheWrite1hTokens,
+                entryCount: row.entryCount,
+                costUSD: cost
+            )
+
+            totals.add(rowTotals)
+            byModel[row.model, default: .zero].add(rowTotals)
+            bySource[source, default: .zero].add(rowTotals)
+            if !row.project.isEmpty {
+                byProject[row.project, default: .zero].add(rowTotals)
+            }
+            let hour = calendar.component(.hour, from: rowDate)
+            byHour[hour, default: .zero].add(rowTotals)
+        }
+
+        guard matched else { return nil }
+
+        let projects = byProject
+            .map { LedgerProjectUsage(path: $0.key, totals: $0.value) }
+            .sorted { $0.totals.costUSD > $1.totals.costUSD }
+
+        return LedgerDayDetail(
+            date: date,
+            totals: totals,
+            byModel: byModel,
+            bySource: bySource,
+            byProject: Array(projects.prefix(6)),
+            byHour: byHour
+        )
+    }
+
+    /// Parses a local "yyyy-MM-dd" day key into the start-of-day Date.
+    public static func parseDayKey(_ key: String) -> Date? {
+        let parts = key.split(separator: "-")
+        guard parts.count == 3,
+              let year = Int(parts[0]), let month = Int(parts[1]), let day = Int(parts[2]) else {
+            return nil
+        }
+        var components = DateComponents()
+        components.year = year
+        components.month = month
+        components.day = day
+        var calendar = Calendar.current
+        calendar.timeZone = TimeZone.current
+        return calendar.date(from: components)
     }
 
     /// Groups hour buckets into 5-hour blocks mirroring Anthropic's session
@@ -410,7 +527,7 @@ public actor TokenLedger {
 
     // MARK: - Date helpers
 
-    static func dayKey(for date: Date, calendar: Calendar) -> String {
+    public static func dayKey(for date: Date, calendar: Calendar) -> String {
         let components = calendar.dateComponents([.year, .month, .day], from: date)
         return String(format: "%04d-%02d-%02d", components.year ?? 0, components.month ?? 0, components.day ?? 0)
     }

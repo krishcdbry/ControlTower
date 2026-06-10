@@ -14,7 +14,6 @@ final class StatusItemController: NSObject {
     private let ledgerStore: TokenLedgerStore
 
     private var popover: NSPopover?
-    private var eventMonitor: Any?
     private var tooltipTimer: Timer?
     private var cachedCustomIcon: NSImage?
     private var didLoadCustomIcon = false
@@ -43,9 +42,6 @@ final class StatusItemController: NSObject {
 
     isolated deinit {
         self.tooltipTimer?.invalidate()
-        if let monitor = self.eventMonitor {
-            NSEvent.removeMonitor(monitor)
-        }
     }
 
     // MARK: - Setup
@@ -205,7 +201,6 @@ final class StatusItemController: NSObject {
     private func togglePopover() {
         if let popover, popover.isShown {
             popover.close()
-            self.removeEventMonitor()
         } else {
             self.showPopover()
         }
@@ -221,7 +216,10 @@ final class StatusItemController: NSObject {
             popover = existing
         } else {
             popover = NSPopover()
-            popover.behavior = .transient
+            // Stay open while the user explores (heatmap, day drill-downs);
+            // dismissed by clicking the status item again, pressing Esc, or
+            // the explicit close paths below — never by clicking elsewhere.
+            popover.behavior = .applicationDefined
             popover.animates = true
             popover.delegate = self
 
@@ -243,6 +241,9 @@ final class StatusItemController: NSObject {
                 onQuit: { [weak self] in
                     self?.popover?.close()
                     NSApp.terminate(nil)
+                },
+                onClose: { [weak self] in
+                    self?.popover?.close()
                 }
             )
 
@@ -257,9 +258,7 @@ final class StatusItemController: NSObject {
         self.ledgerStore.refresh()
 
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-
-        // Setup event monitor to close on click outside
-        self.setupEventMonitor()
+        popover.contentViewController?.view.window?.makeKey()
     }
 
     private func showContextMenu() {
@@ -305,22 +304,6 @@ final class StatusItemController: NSObject {
         statusItem.menu = nil
     }
 
-    // MARK: - Event Monitor
-
-    private func setupEventMonitor() {
-        self.eventMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            self?.popover?.close()
-            self?.removeEventMonitor()
-        }
-    }
-
-    private func removeEventMonitor() {
-        if let monitor = eventMonitor {
-            NSEvent.removeMonitor(monitor)
-            self.eventMonitor = nil
-        }
-    }
-
     // MARK: - Menu Actions
 
     @objc private func refreshNow() {
@@ -345,13 +328,7 @@ final class StatusItemController: NSObject {
 
 // MARK: - NSPopoverDelegate
 
-extension StatusItemController: NSPopoverDelegate {
-    func popoverDidClose(_ notification: Notification) {
-        // The popover can close transiently (click outside) or programmatically;
-        // always tear down the global event monitor so they don't accumulate.
-        self.removeEventMonitor()
-    }
-}
+extension StatusItemController: NSPopoverDelegate {}
 
 // MARK: - Dashboard Popover View
 
