@@ -23,7 +23,17 @@ A unified macOS menu bar app for monitoring AI coding assistant usage across mul
 
 ```bash
 brew tap krishcdbry/tap
-brew install control-tower
+brew trust krishcdbry/tap   # Homebrew 5+ requires trusting third-party taps
+brew install --cask control-tower
+```
+
+On Homebrew 4 and earlier, skip the `brew trust` line.
+
+Upgrading from an earlier version:
+
+```bash
+brew trust krishcdbry/tap   # once, if brew reports the cask as not found in source
+brew upgrade --cask control-tower
 ```
 
 ### Manual Installation
