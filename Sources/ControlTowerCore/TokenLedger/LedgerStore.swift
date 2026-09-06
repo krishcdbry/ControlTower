@@ -120,6 +120,14 @@ final class LedgerStore: Sendable {
             try db.execute(sql: "DELETE FROM file_cursor WHERE source = 'codex'")
         }
 
+        migrator.registerMigration("ledger_v5_codex_sources") { db in
+            // Source attribution comes from the session header, so existing
+            // files must be replayed once even if no bytes were appended.
+            try db.execute(sql: "DELETE FROM dedup_keys WHERE path IN (SELECT path FROM file_cursor WHERE source LIKE 'codex%')")
+            try db.execute(sql: "DELETE FROM usage_hours WHERE source LIKE 'codex%'")
+            try db.execute(sql: "DELETE FROM file_cursor WHERE source LIKE 'codex%'")
+        }
+
         try migrator.migrate(self.dbQueue)
     }
 

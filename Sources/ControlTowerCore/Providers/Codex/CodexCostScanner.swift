@@ -5,7 +5,7 @@ import Foundation
 /// This is now a thin adapter over `CodexLedger`, which ingests Codex rollout
 /// files incrementally (per-file byte cursors + monotonic-total dedup + SQLite
 /// aggregates) instead of re-reading every session file on each scan.
-/// Costs are nil when a period includes models without known pricing.
+/// Ledger costs include disclosed fallback estimates for unlisted models.
 ///
 /// Counting semantics (verified against real rollouts): per-turn deltas from
 /// `last_token_usage` are summed; `cached_input_tokens` is a subset of input
@@ -96,7 +96,7 @@ public actor CodexCostScanner {
         return lhs + rhs
     }
 
-    static func adapt(_ ledger: CodexLedgerSnapshot, now: Date = Date()) -> CostSnapshot {
+    public static func adapt(_ ledger: CodexLedgerSnapshot, now: Date = Date()) -> CostSnapshot {
         var calendar = Calendar.current
         calendar.timeZone = TimeZone.current
         let todayKey = TokenLedger.dayKey(for: now, calendar: calendar)
@@ -151,9 +151,15 @@ public actor CodexCostScanner {
 /// https://developers.openai.com/api/docs/models/gpt-5.6-luna
 /// https://developers.openai.com/api/docs/models/gpt-5.4-mini
 /// https://developers.openai.com/api/docs/models/gpt-5.2
+/// https://help.openai.com/en/articles/20001415-chatgpt-rate-card-enterprise-token-based-pricing
 /// These base rates exclude service-tier, long-context, and cache-write
 /// surcharges. They are not the cost of a ChatGPT subscription.
 public enum CodexPricing {
+    /// A disclosed representative rate for unlisted/internal models, following
+    /// the same estimation approach as ClaudePricing's Sonnet-class fallback.
+    /// This is an assumption, not the published price of an internal model.
+    public static let fallbackModel = "gpt-5.6-sol"
+
     public struct ModelPrice: Sendable {
         public let inputPerMillion: Double
         public let cachedInputPerMillion: Double
@@ -183,6 +189,8 @@ public enum CodexPricing {
         "gpt-5.5": gpt55,
         "gpt-5.4-mini": ModelPrice(input: 0.75, output: 4.5),
         "gpt-5.4": gpt54,
+        // OpenAI's Work/Codex rate card identifies auto review as GPT-5.4.
+        "codex-auto-review": gpt54,
         "gpt-5.3-codex": codex53,
         "gpt-5.2-codex": codex53,
         "gpt-5.2": codex53,
@@ -196,7 +204,7 @@ public enum CodexPricing {
         "o4-mini": o4Mini,
     ]
 
-    /// Only published model IDs and their dated snapshots have known prices.
+    /// Published model IDs, documented aliases, and dated snapshots have known prices.
     /// An unknown model must not silently inherit another model's rate.
     public static func price(for model: String) -> ModelPrice? {
         let normalized = model.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
@@ -219,5 +227,17 @@ public enum CodexPricing {
         return Double(inputTokens) / 1_000_000 * price.inputPerMillion
             + Double(cachedInputTokens) / 1_000_000 * price.cachedInputPerMillion
             + Double(outputTokens) / 1_000_000 * price.outputPerMillion
+    }
+
+    public static func estimatedCost(
+        model: String,
+        inputTokens: Int,
+        cachedInputTokens: Int,
+        outputTokens: Int
+    ) -> Double {
+        let rate = Self.price(for: model) ?? Self.pricing[Self.fallbackModel]!
+        return Double(inputTokens) / 1_000_000 * rate.inputPerMillion
+            + Double(cachedInputTokens) / 1_000_000 * rate.cachedInputPerMillion
+            + Double(outputTokens) / 1_000_000 * rate.outputPerMillion
     }
 }

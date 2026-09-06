@@ -20,11 +20,25 @@ public struct CodexLedgerSnapshot: Sendable {
     /// Last 30 local days, ascending by date.
     public let days: [CodexLedgerDay]
     public let stats: LedgerScanStats
+    public let analytics: LedgerSnapshot
+    public let last5Hours: TokenTotals
+    public let fallbackModels: Set<String>
+    public let fallbackTokens: Int
+    public let fallbackCostUSD: Double
 
-    public init(generatedAt: Date = Date(), days: [CodexLedgerDay] = [], stats: LedgerScanStats = LedgerScanStats()) {
+    public init(
+        generatedAt: Date = Date(), days: [CodexLedgerDay] = [], stats: LedgerScanStats = LedgerScanStats(),
+        analytics: LedgerSnapshot = LedgerSnapshot(), last5Hours: TokenTotals = .zero,
+        fallbackModels: Set<String> = [], fallbackTokens: Int = 0, fallbackCostUSD: Double = 0
+    ) {
         self.generatedAt = generatedAt
         self.days = days
         self.stats = stats
+        self.analytics = analytics
+        self.last5Hours = last5Hours
+        self.fallbackModels = fallbackModels
+        self.fallbackTokens = fallbackTokens
+        self.fallbackCostUSD = fallbackCostUSD
     }
 }
 
@@ -43,7 +57,7 @@ public actor CodexLedger {
     private var lastScanAt: Date?
     private let minScanInterval: TimeInterval = 5
     private let historyCutoffDays = 190
-    private let windowDays = 30
+    private let activityDays = 180
 
     public init(storeURL: URL? = nil, environment: [String: String] = ProcessInfo.processInfo.environment) {
         self.storeURL = storeURL ?? Self.defaultStoreURL()
@@ -173,7 +187,7 @@ public actor CodexLedger {
                 )
                 let accepted = try store.commit(
                     path: file.url.path,
-                    source: "codex",
+                    source: result.source?.rawValue ?? cursor?.source ?? UsageSource.codexOther.rawValue,
                     project: result.cwd ?? cursor?.project ?? "",
                     entries: result.entries,
                     size: file.size,
@@ -206,70 +220,14 @@ public actor CodexLedger {
     // MARK: - Snapshot building
 
     private func buildSnapshot(store: LedgerStore, stats: LedgerScanStats, now: Date) throws -> CodexLedgerSnapshot {
-        let since = Int64(now.timeIntervalSince1970) - Int64(self.windowDays + 1) * 86400
-        let rows = try store.hourRows(since: since)
+        let since = Int64(now.timeIntervalSince1970) - Int64(self.activityDays + 1) * 86400
+        return CodexAnalytics.build(rows: try store.hourRows(since: since), stats: stats, now: now)
+    }
 
-        var calendar = Calendar.current
-        calendar.timeZone = TimeZone.current
-        let todayKey = TokenLedger.dayKey(for: now, calendar: calendar)
-        let last30Start = TokenLedger.dayKey(
-            for: now.addingTimeInterval(-Double(self.windowDays - 1) * 86400),
-            calendar: calendar
-        )
-
-        struct DayBucket {
-            var input = 0
-            var cached = 0
-            var output = 0
-            var reasoning = 0
-            var cost: Double = 0
-            var hasUnknownPrice = false
-        }
-        var dayBuckets: [String: DayBucket] = [:]
-        var dayKeyCache: [Int64: String] = [:]
-
-        for row in rows {
-            let dayKey: String
-            if let cached = dayKeyCache[row.hourStart] {
-                dayKey = cached
-            } else {
-                dayKey = TokenLedger.dayKey(
-                    for: Date(timeIntervalSince1970: TimeInterval(row.hourStart)),
-                    calendar: calendar
-                )
-                dayKeyCache[row.hourStart] = dayKey
-            }
-            guard dayKey >= last30Start, dayKey <= todayKey else { continue }
-
-            // Column mapping documented in CodexSessionIngestor:
-            // input = non-cached input, cache_read = cached, cache_w5m = reasoning.
-            let cost = CodexPricing.cost(
-                model: row.model,
-                inputTokens: row.inputTokens,
-                cachedInputTokens: row.cacheReadTokens,
-                outputTokens: row.outputTokens
-            )
-            var bucket = dayBuckets[dayKey] ?? DayBucket()
-            bucket.input += row.inputTokens
-            bucket.cached += row.cacheReadTokens
-            bucket.output += row.outputTokens
-            bucket.reasoning += row.cacheWrite5mTokens
-            if let cost { bucket.cost += cost } else { bucket.hasUnknownPrice = true }
-            dayBuckets[dayKey] = bucket
-        }
-
-        let days = dayBuckets.keys.sorted().compactMap { key -> CodexLedgerDay? in
-            guard let bucket = dayBuckets[key] else { return nil }
-            return CodexLedgerDay(
-                date: key,
-                inputTokens: bucket.input,
-                cachedInputTokens: bucket.cached,
-                outputTokens: bucket.output,
-                reasoningTokens: bucket.reasoning,
-                costUSD: bucket.hasUnknownPrice ? nil : bucket.cost
-            )
-        }
-
-        return CodexLedgerSnapshot(generatedAt: now, days: days, stats: stats)
+    public func dayDetail(date: String) async -> LedgerDayDetail? {
+        guard let start = TokenLedger.parseDayKey(date),
+              let store = try? self.openStore(),
+              let rows = try? store.hourRows(since: Int64(start.timeIntervalSince1970) - 86400) else { return nil }
+        return CodexAnalytics.dayDetail(rows: rows, date: date)
     }
 }

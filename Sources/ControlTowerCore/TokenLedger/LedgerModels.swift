@@ -6,6 +6,11 @@ public enum UsageSource: String, Sendable, Codable, CaseIterable, Hashable {
     case claudeCode = "code"
     /// Claude Desktop app sessions, including Cowork (identified via the Desktop session catalog).
     case claudeDesktop = "desktop"
+    case codexDesktop = "codex-desktop"
+    case codexCLI = "codex-cli"
+    case codexIDE = "codex-ide"
+    case codexAgent = "codex-agent"
+    case codexOther = "codex"
     /// Control Tower's own CLI probe sessions (excluded from cost totals).
     case probe = "probe"
 
@@ -13,6 +18,11 @@ public enum UsageSource: String, Sendable, Codable, CaseIterable, Hashable {
         switch self {
         case .claudeCode: "Claude Code"
         case .claudeDesktop: "Desktop / Cowork"
+        case .codexDesktop: "Desktop / Work"
+        case .codexCLI: "Codex CLI"
+        case .codexIDE: "Codex IDE"
+        case .codexAgent: "Background agents"
+        case .codexOther: "Other Codex"
         case .probe: "Probe"
         }
     }

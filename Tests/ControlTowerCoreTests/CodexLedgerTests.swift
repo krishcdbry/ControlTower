@@ -33,7 +33,7 @@ struct CodexPricingTests {
         #expect(CodexPricing.price(for: "gpt-5.4-mini-2026-03-17")?.inputPerMillion == 0.75)
         #expect(CodexPricing.price(for: "gpt-5.3-codex-spark") == nil)
         #expect(CodexPricing.price(for: "something-new") == nil)
-        #expect(CodexPricing.price(for: "codex-auto-review") == nil)
+        #expect(CodexPricing.price(for: "codex-internal-unlisted") == nil)
     }
 
     @Test("Cost math: input excludes cached, output includes reasoning")

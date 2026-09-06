@@ -119,7 +119,7 @@ struct CodexIntegrationTests {
         #expect(second.model == "gpt-6-astra")
     }
 
-    @Test("Unknown pricing preserves token totals without fabricating a cost")
+    @Test("Unlisted models retain totals and disclose their estimated cost")
     func unknownPrice() async throws {
         let fixture = try CodexFixture()
         defer { fixture.remove() }
@@ -127,8 +127,31 @@ struct CodexIntegrationTests {
         let result = await fixture.ledger().snapshot(forceScan: true)
         let cost = CodexCostScanner.adapt(result)
         #expect(cost.last30DaysTokens == 110)
-        #expect(cost.last30DaysCostUSD == nil)
-        #expect(cost.dailyCosts.first?.costUSD == nil)
+        #expect(cost.last30DaysCostUSD == 0.000312)
+        #expect(result.fallbackModels == ["new-unpriced-model"])
+        #expect(result.fallbackTokens == 110)
+        #expect(cost.dailyCosts.first?.costUSD == cost.last30DaysCostUSD)
+    }
+
+    @Test("App attribution survives incremental scans and day drill-down reads")
+    func incrementalSource() async throws {
+        let fixture = try CodexFixture()
+        defer { fixture.remove() }
+        let metadata = #"{"type":"session_meta","payload":{"source":"vscode","originator":"codex_work_desktop","cwd":"/fixture"}}"# + "\n"
+        let url = try fixture.write(metadata + CodexFixture.context() + CodexFixture.record())
+        let ledger = fixture.ledger()
+        let first = await ledger.snapshot(forceScan: true)
+        #expect(first.analytics.bySource[.codexDesktop]?.totalTokens == 110)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(CodexFixture.record(id: "new", total: 220).utf8))
+        try handle.close()
+        let second = await ledger.snapshot(forceScan: true)
+        #expect(second.analytics.bySource[.codexDesktop]?.totalTokens == 220)
+        let day = try #require(second.days.last?.date)
+        let detail = await ledger.dayDetail(date: day)
+        #expect(detail?.totals.totalTokens == 220)
+        #expect(detail?.bySource[.codexDesktop]?.totalTokens == 220)
     }
 
     @Test("Resuming with reset counters includes the first new response")
@@ -150,7 +173,7 @@ struct CodexIntegrationTests {
         try store.commit(path: "old-claude", source: "claudeCode", project: "", entries: [], size: 200, mtime: 1, offset: 200)
         let queue = try DatabaseQueue(path: fixture.database.path)
         try queue.write { db in
-            try db.execute(sql: "DELETE FROM grdb_migrations WHERE identifier = 'ledger_v4_codex_records'")
+            try db.execute(sql: "DELETE FROM grdb_migrations WHERE identifier IN ('ledger_v4_codex_records', 'ledger_v5_codex_sources')")
         }
         let upgraded = try LedgerStore(url: fixture.database)
         let cursors = try upgraded.allCursors()

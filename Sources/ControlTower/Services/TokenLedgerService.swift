@@ -11,6 +11,7 @@ import Logging
 @Observable
 final class TokenLedgerStore {
     private(set) var snapshot: LedgerSnapshot?
+    private(set) var codexLedger: CodexLedgerSnapshot?
     private(set) var codexSnapshot: CodexCostScanner.CostSnapshot?
     private(set) var isLoading = false
 
@@ -27,11 +28,12 @@ final class TokenLedgerStore {
         self.isLoading = self.snapshot == nil
         self.refreshTask = Task { [weak self] in
             async let result = TokenLedger.shared.snapshot(forceScan: force)
-            async let codexResult = CodexCostScanner.shared.scan(forceRefresh: force)
+            async let codexResult = CodexLedger.shared.snapshot(forceScan: force)
             let (claude, codex) = await (result, codexResult)
             guard let self else { return }
             self.snapshot = claude
-            self.codexSnapshot = codex
+            self.codexLedger = codex
+            self.codexSnapshot = CodexCostScanner.adapt(codex)
             self.isLoading = false
             self.refreshTask = nil
             if self.pendingRefresh {
@@ -47,8 +49,9 @@ final class TokenLedgerStore {
     }
 
     /// Drill-down for one heatmap day.
-    func dayDetail(_ date: String) async -> LedgerDayDetail? {
-        await TokenLedger.shared.dayDetail(date: date)
+    func dayDetail(_ date: String, provider: ProviderID = .claude) async -> LedgerDayDetail? {
+        if provider == .codex { return await CodexLedger.shared.dayDetail(date: date) }
+        return await TokenLedger.shared.dayDetail(date: date)
     }
 }
 

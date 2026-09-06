@@ -193,6 +193,10 @@ struct ControlTowerCLI {
         print("  Last 30 days   \(fmt(cost.last30DaysTokens).padding(toLength: 10, withPad: " ", startingAt: 0)) \(money(cost.last30DaysCostUSD))")
 
         print("  Costs are API estimates at base rates, excluding subscription charges and pricing modifiers.")
+        if !snapshot.fallbackModels.isEmpty {
+            print("  Unlisted models estimated at \(CodexPricing.fallbackModel) rates: \(snapshot.fallbackModels.sorted().joined(separator: ", "))")
+            print(String(format: "  Fallback portion: %d tokens, ~$%.2f", snapshot.fallbackTokens, snapshot.fallbackCostUSD))
+        }
         if !cost.dailyCosts.isEmpty {
             print()
             print("Days with activity (30d): \(cost.dailyCosts.count)")

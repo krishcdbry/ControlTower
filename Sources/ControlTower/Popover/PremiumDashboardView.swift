@@ -15,7 +15,6 @@ struct PremiumDashboardView: View {
     var onClose: () -> Void = {}
 
     @State private var selectedProvider: ProviderID?
-    private var codexCostSnapshot: CodexCostScanner.CostSnapshot? { ledgerStore.codexSnapshot }
     @State private var isLoadingCost = false
     @State private var selectedHeatDay: String?
     @State private var heatDayDetail: LedgerDayDetail?
@@ -62,19 +61,29 @@ struct PremiumDashboardView: View {
             Task { await loadCostData() }
         }
         .onChange(of: selectedProvider) { _, newProvider in
+            selectedHeatDay = nil
+            heatDayDetail = nil
             // Load provider-specific cost data when selected
             Task { await loadProviderCostData(newProvider) }
         }
-        .task(id: selectedHeatDay) {
+        .task(id: dayDetailTaskID) {
             guard let day = selectedHeatDay else {
                 heatDayDetail = nil
                 return
             }
-            heatDayDetail = await ledgerStore.dayDetail(day)
+            let detail = await ledgerStore.dayDetail(day, provider: selectedProvider ?? .claude)
+            guard !Task.isCancelled else { return }
+            heatDayDetail = detail
         }
         .onExitCommand {
             onClose()
         }
+    }
+
+    private var dayDetailTaskID: String {
+        let updated = selectedProvider == .codex
+            ? ledgerStore.codexLedger?.generatedAt : ledgerStore.snapshot?.generatedAt
+        return "\(selectedProvider?.rawValue ?? ""): \(selectedHeatDay ?? ""): \(updated?.timeIntervalSince1970 ?? 0)"
     }
 
     private func loadCostData() async {
@@ -244,12 +253,14 @@ struct PremiumDashboardView: View {
                 pace: pace
             )
 
-            // Token Usage Section
-            if provider == .claude {
-                if let ledger = ledgerStore.snapshot {
-                    // Live 5-hour block (burn rate, projection, reset countdown).
-                    if let block = ledger.currentBlock {
+            // Both providers use the same history and drill-down components.
+            if provider == .claude || provider == .codex {
+                let ledger = provider == .codex ? ledgerStore.codexLedger?.analytics : ledgerStore.snapshot
+                if let ledger {
+                    if provider == .claude, let block = ledger.currentBlock {
                         GlassLiveBlockCard(block: block)
+                    } else if provider == .codex, let codex = ledgerStore.codexLedger {
+                        CodexRecentUsageCard(totals: codex.last5Hours)
                     }
 
                     SimpleTokenSummary(
@@ -258,83 +269,40 @@ struct PremiumDashboardView: View {
                         last7DaysTokens: ledger.last7Days.totalTokens,
                         last7DaysCost: ledger.last7Days.costUSD,
                         last30DaysTokens: ledger.last30Days.totalTokens,
-                        last30DaysCost: ledger.last30Days.costUSD
+                        last30DaysCost: ledger.last30Days.costUSD,
+                        isEstimated: provider == .codex
                     )
 
-                    // Per-app split: Claude Code vs Desktop/Cowork, plus top projects.
-                    if !ledger.bySource.isEmpty {
-                        GlassSourceBreakdownCard(
-                            bySource: ledger.bySource,
-                            topProjects: Array(ledger.byProject.prefix(3))
-                        )
+                    if provider == .codex, let codex = ledgerStore.codexLedger {
+                        CodexEstimateNote(snapshot: codex)
                     }
-
-                    // Activity heatmap with per-day drill-down.
-                    if !ledger.dailyActivity.isEmpty {
-                        GlassHeatmapCard(
-                            activity: ledger.dailyActivity,
-                            selectedDay: $selectedHeatDay
-                        )
-                        if let day = selectedHeatDay {
-                            if let detail = heatDayDetail {
-                                GlassDayDetailCard(detail: detail) {
-                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
-                                        selectedHeatDay = nil
-                                    }
-                                }
-                            } else {
-                                GlassDayDetailLoading(date: day)
-                            }
+                    if !ledger.bySource.isEmpty {
+                        GlassSourceBreakdownCard(bySource: ledger.bySource, topProjects: Array(ledger.byProject.prefix(3)))
+                    }
+                    if provider == .codex, !ledger.byModel.isEmpty {
+                        CodexModelUsageCard(byModel: ledger.byModel)
+                    }
+                    GlassHeatmapCard(activity: ledger.dailyActivity, selectedDay: $selectedHeatDay)
+                    if let day = selectedHeatDay {
+                        if let detail = heatDayDetail, detail.date == day {
+                            GlassDayDetailCard(
+                                detail: detail,
+                                onDismiss: {
+                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { selectedHeatDay = nil }
+                                },
+                                costLabel: provider == .codex ? "Est. Cost" : "Cost",
+                                entryLabel: provider == .codex ? "Requests" : "Messages"
+                            )
+                        } else {
+                            GlassDayDetailLoading(date: day)
                         }
                     }
-
-                    if ledger.stats.isInitialScan {
-                        Text("Indexed \(ledger.stats.filesParsed) transcripts (\(ledger.stats.entriesAdded) messages)")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.white.opacity(0.4))
-                    }
-                } else if ledgerStore.isLoading || isLoadingCost {
-                    TokenLoadingPlaceholder()
-                }
-            } else if provider == .codex {
-                if let costData = codexCostSnapshot {
-                    SimpleTokenSummary(
-                        todayTokens: costData.todayTokens,
-                        todayCost: costData.todayCostUSD,
-                        last7DaysTokens: costData.last7DaysTokens,
-                        last7DaysCost: costData.last7DaysCostUSD,
-                        last30DaysTokens: costData.last30DaysTokens,
-                        last30DaysCost: costData.last30DaysCostUSD
-                    )
-                    Text(costData.last30DaysCostUSD == nil
-                         ? "Token totals include models without known prices. Cost is unavailable for those periods."
-                         : "Estimated API cost at standard base rates. Subscription charges and pricing modifiers are excluded.")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.white.opacity(0.6))
-                } else if isLoadingCost {
-                    TokenLoadingPlaceholder()
-                }
-            }
-
-            // Cost Chart
-            if provider == .claude {
-                if let ledger = ledgerStore.snapshot, !ledger.days.isEmpty {
                     GlassCostChartCard(
                         dailyCosts: ledger.days.map { .init(date: $0.date, totalTokens: $0.totals.totalTokens, costUSD: $0.totals.costUSD) },
                         updatedAt: ledger.generatedAt
                     )
                 } else if ledgerStore.isLoading || isLoadingCost {
-                    ChartLoadingPlaceholder()
-                }
-            } else if provider == .codex {
-                if let costData = codexCostSnapshot, !costData.dailyCosts.isEmpty, costData.last30DaysCostUSD != nil {
-                    GlassCostChartCard(
-                        dailyCosts: costData.dailyCosts.compactMap { day in
-                            day.costUSD.map { .init(date: day.date, totalTokens: day.totalTokens, costUSD: $0) }
-                        },
-                        updatedAt: costData.updatedAt
-                    )
-                } else if isLoadingCost {
+                    TokenLoadingPlaceholder()
                     ChartLoadingPlaceholder()
                 }
             }
@@ -377,6 +345,7 @@ struct PremiumDashboardView: View {
         let last7DaysCost: Double?
         let last30DaysTokens: Int
         let last30DaysCost: Double?
+        var isEstimated = false
 
         var body: some View {
             HStack(spacing: 20) {
@@ -415,7 +384,7 @@ struct PremiumDashboardView: View {
                     .font(.system(size: 15, weight: .bold, design: .rounded))
                     .foregroundStyle(.white)
 
-                Text(cost.map { String(format: "$%.2f", $0) } ?? "Price unavailable")
+                Text(cost.map { String(format: isEstimated ? "~$%.2f" : "$%.2f", $0) } ?? "Price unavailable")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.green)
             }
@@ -482,7 +451,7 @@ struct PremiumDashboardView: View {
                         .font(.system(size: 14))
                         .foregroundStyle(.green.opacity(0.5))
 
-                    Text("Usage History (7 Days)")
+                    Text("Usage History")
                         .font(.system(size: 14, weight: .bold))
                         .foregroundStyle(.white.opacity(0.5))
 
@@ -1362,7 +1331,7 @@ struct GlassTokenStatBox: View {
 // MARK: - Generic Daily Cost for Chart
 
 struct ChartDailyCost: Identifiable {
-    let id = UUID()
+    var id: String { date }
     let date: String
     let totalTokens: Int
     let costUSD: Double
@@ -1380,8 +1349,13 @@ struct GlassCostChartCard: View {
     let dailyCosts: [ChartDailyCost]
     let updatedAt: Date?
 
+    @State private var dayCount = 7
+
     private var recentCosts: [ChartDailyCost] {
-        Array(dailyCosts.suffix(7))
+        LedgerHistory.dailySeries(
+            dailyCosts.map { .init(date: $0.date, totalTokens: $0.totalTokens, costUSD: $0.costUSD) },
+            days: dayCount, endingAt: updatedAt ?? Date()
+        ).map { .init(date: $0.date, totalTokens: $0.totalTokens, costUSD: $0.costUSD) }
     }
 
     private var totalTokens: Int {
@@ -1395,6 +1369,12 @@ struct GlassCostChartCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             chartHeader
+            Picker("History period", selection: $dayCount) {
+                Text("7 Days").tag(7)
+                Text("30 Days").tag(30)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
             chartContent
             chartSummary
         }
@@ -1415,7 +1395,7 @@ struct GlassCostChartCard: View {
                 .font(.system(size: 14))
                 .foregroundStyle(.green)
 
-            Text("Usage History (7 Days)")
+            Text("Usage History")
                 .font(.system(size: 14, weight: .bold))
                 .foregroundStyle(.white)
 
@@ -1432,13 +1412,13 @@ struct GlassCostChartCard: View {
     private var chartContent: some View {
         Chart(recentCosts, id: \.date) { item in
             BarMark(
-                x: .value("Date", formatDayLabel(item.date)),
+                x: .value("Date", item.date),
                 y: .value("Tokens", item.totalTokens)
             )
             .foregroundStyle(.green.gradient)
             .cornerRadius(4)
             .annotation(position: .top, spacing: 4) {
-                if item.totalTokens > 0 {
+                if dayCount == 7, item.totalTokens > 0 {
                     Text(formatChartTokens(item.totalTokens))
                         .font(.system(size: 8, weight: .medium))
                         .foregroundStyle(.white.opacity(0.7))
@@ -1446,10 +1426,12 @@ struct GlassCostChartCard: View {
             }
         }
         .chartXAxis {
-            AxisMarks { value in
+            AxisMarks(values: recentCosts.enumerated().compactMap { index, day in
+                dayCount == 7 || index % 5 == 2 ? day.date : nil
+            }) { value in
                 AxisValueLabel {
                     if let label = value.as(String.self) {
-                        Text(label)
+                        Text(formatDayLabel(label))
                             .font(.system(size: 10, weight: .medium))
                             .foregroundStyle(.white.opacity(0.6))
                     }
@@ -1467,7 +1449,7 @@ struct GlassCostChartCard: View {
         guard let date = formatter.date(from: dateString) else { return dateString }
 
         let dayFormatter = DateFormatter()
-        dayFormatter.dateFormat = "EEE"
+        dayFormatter.dateFormat = dayCount == 7 ? "EEE" : "MMM d"
         return dayFormatter.string(from: date)
     }
 
@@ -1846,7 +1828,7 @@ struct GlassSourceBreakdownCard: View {
     private func sourceRow(_ source: UsageSource, totals: TokenTotals) -> some View {
         VStack(spacing: 4) {
             HStack {
-                Image(systemName: source == .claudeDesktop ? "macwindow" : "terminal.fill")
+                Image(systemName: source == .claudeDesktop || source == .codexDesktop ? "macwindow" : source == .codexAgent ? "gearshape.2.fill" : "terminal.fill")
                     .font(.system(size: 11))
                     .foregroundStyle(self.color(for: source))
                 Text(source.displayName)
@@ -1877,9 +1859,11 @@ struct GlassSourceBreakdownCard: View {
 
     private func color(for source: UsageSource) -> Color {
         switch source {
-        case .claudeDesktop: .purple
-        case .claudeCode: .cyan
-        case .probe: .gray
+        case .claudeDesktop, .codexDesktop: .purple
+        case .claudeCode, .codexCLI: .cyan
+        case .codexIDE: .blue
+        case .codexAgent: .orange
+        case .probe, .codexOther: .gray
         }
     }
 
@@ -2114,6 +2098,8 @@ struct GlassHeatmapCard: View {
 struct GlassDayDetailCard: View {
     let detail: LedgerDayDetail
     let onDismiss: () -> Void
+    var costLabel = "Cost"
+    var entryLabel = "Messages"
 
     var body: some View {
         VStack(alignment: .leading, spacing: 13) {
@@ -2134,9 +2120,9 @@ struct GlassDayDetailCard: View {
             HStack(spacing: 14) {
                 stat(Self.formatTokens(detail.totals.totalTokens), "Tokens")
                 divider
-                stat(String(format: "$%.2f", detail.totals.costUSD), "Cost", color: .green)
+                stat(String(format: "$%.2f", detail.totals.costUSD), costLabel, color: .green)
                 divider
-                stat("\(detail.totals.entryCount)", "Messages")
+                stat("\(detail.totals.entryCount)", entryLabel)
                 divider
                 stat("\(detail.byModel.count)", "Models")
             }

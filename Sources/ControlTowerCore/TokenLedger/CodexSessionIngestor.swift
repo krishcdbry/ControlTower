@@ -14,6 +14,7 @@ struct CodexParseResult: Sendable {
     let model: String
     /// Working directory from session metadata, if seen.
     let cwd: String?
+    let source: UsageSource?
     let bytesRead: Int64
 }
 
@@ -64,6 +65,7 @@ enum CodexSessionIngestor {
         var lastTotal = lastTotalTokens
         var model = initialModel.isEmpty ? Self.defaultModel : initialModel
         var cwd: String?
+        var source: UsageSource?
         var hourCache: [String: Int64] = [:]
 
         while true {
@@ -80,6 +82,7 @@ enum CodexSessionIngestor {
                     lastTotal: &lastTotal,
                     model: &model,
                     cwd: &cwd,
+                    source: &source,
                     hourCache: &hourCache
                 )
                 consumed += Int64(newlineIndex - lineStart + 1)
@@ -94,6 +97,7 @@ enum CodexSessionIngestor {
             lastTotalTokens: lastTotal,
             model: model,
             cwd: cwd,
+            source: source,
             bytesRead: bytesRead
         )
     }
@@ -106,6 +110,7 @@ enum CodexSessionIngestor {
         lastTotal: inout Int64,
         model: inout String,
         cwd: inout String?,
+        source: inout UsageSource?,
         hourCache: inout [String: Int64]
     ) {
         guard !line.isEmpty else { return }
@@ -123,11 +128,12 @@ enum CodexSessionIngestor {
         }
 
         // Project attribution from session metadata.
-        if cwd == nil, Self.contains(line, pattern: Self.sessionMetaPattern) {
+        if Self.contains(line, pattern: Self.sessionMetaPattern) {
             if let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
                obj["type"] as? String == "session_meta",
                let payload = obj["payload"] as? [String: Any] {
                 cwd = payload["cwd"] as? String
+                source = Self.usageSource(metadata: payload)
             }
             return
         }
@@ -203,6 +209,19 @@ enum CodexSessionIngestor {
         if let intVal = value as? Int { return max(0, intVal) }
         if let number = value as? NSNumber { return max(0, number.intValue) }
         return 0
+    }
+
+    static func usageSource(metadata: [String: Any]) -> UsageSource {
+        if let source = metadata["source"] as? [String: Any], source["subagent"] != nil {
+            return .codexAgent
+        }
+        let originator = (metadata["originator"] as? String ?? "").lowercased()
+        if originator.contains("desktop") { return .codexDesktop }
+        switch metadata["source"] as? String {
+        case "cli", "exec": return .codexCLI
+        case "vscode": return .codexIDE
+        default: return .codexOther
+        }
     }
 
     // Minute buckets preserve local midnight in half-hour and quarter-hour
