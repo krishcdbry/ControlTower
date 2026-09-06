@@ -51,6 +51,11 @@ public struct UsageSnapshot: Sendable, Equatable {
         self.metadata = metadata
     }
 
+    /// Distinguishes a measured zero from unavailable quota data.
+    public var hasUsageWindows: Bool {
+        primary != nil || secondary != nil || tertiary != nil
+    }
+
     /// Returns the highest usage percentage across all windows.
     public var highestUsagePercent: Double {
         [primary?.usedPercent, secondary?.usedPercent, tertiary?.usedPercent]

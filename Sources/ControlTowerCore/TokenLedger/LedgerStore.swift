@@ -113,6 +113,13 @@ final class LedgerStore: Sendable {
             try db.execute(sql: "DELETE FROM file_cursor")
         }
 
+        // Rebuild only Codex derived data for durable records and fork dedup.
+        migrator.registerMigration("ledger_v4_codex_records") { db in
+            try db.execute(sql: "DELETE FROM dedup_keys WHERE path IN (SELECT path FROM file_cursor WHERE source = 'codex')")
+            try db.execute(sql: "DELETE FROM usage_hours WHERE source = 'codex'")
+            try db.execute(sql: "DELETE FROM file_cursor WHERE source = 'codex'")
+        }
+
         try migrator.migrate(self.dbQueue)
     }
 

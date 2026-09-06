@@ -162,9 +162,11 @@ final class StatusItemController: NSObject {
         var lines: [String] = ["Control Tower"]
 
         for provider in settingsStore.enabledProviders.sorted(by: { $0.rawValue < $1.rawValue }) {
-            if let snapshot = usageStore.snapshots[provider] {
+            if let snapshot = usageStore.snapshots[provider], snapshot.hasUsageWindows {
                 let usage = Int(snapshot.highestUsagePercent)
                 lines.append("\(provider.displayName): \(usage)%")
+            } else if usageStore.snapshots[provider] != nil {
+                lines.append("\(provider.displayName): Usage unavailable")
             } else if usageStore.errors[provider] != nil {
                 lines.append("\(provider.displayName): Error")
             }
@@ -274,7 +276,7 @@ final class StatusItemController: NSObject {
         // Provider status
         for provider in settingsStore.enabledProviders.sorted(by: { $0.rawValue < $1.rawValue }) {
             let item = NSMenuItem()
-            if let snapshot = usageStore.snapshots[provider] {
+            if let snapshot = usageStore.snapshots[provider], snapshot.hasUsageWindows {
                 let usage = Int(snapshot.highestUsagePercent)
                 item.title = "\(provider.displayName): \(usage)%"
             } else {
@@ -435,7 +437,7 @@ struct ProviderCardView: View {
 
                     Spacer()
 
-                    if let snapshot {
+                    if let snapshot, snapshot.hasUsageWindows {
                         Text("\(Int(snapshot.highestUsagePercent))%")
                             .font(.title2)
                             .fontWeight(.semibold)

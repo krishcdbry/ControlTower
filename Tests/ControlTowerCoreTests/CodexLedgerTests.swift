@@ -8,24 +8,32 @@ import Testing
 struct CodexPricingTests {
     @Test("Known model rates")
     func knownModels() {
-        #expect(CodexPricing.price(for: "gpt-5.4").inputPerMillion == 2.5)
-        #expect(CodexPricing.price(for: "gpt-5.4").outputPerMillion == 15.0)
-        #expect(CodexPricing.price(for: "gpt-5.3-codex").inputPerMillion == 1.75)
-        #expect(CodexPricing.price(for: "gpt-5.1-codex-max").inputPerMillion == 1.25)
-        #expect(CodexPricing.price(for: "gpt-5.1-codex-max").outputPerMillion == 10.0)
+        #expect(CodexPricing.price(for: "gpt-6-astra")?.inputPerMillion == 10)
+        #expect(CodexPricing.price(for: "gpt-6-astra")?.outputPerMillion == 50)
+        #expect(CodexPricing.price(for: "gpt-5.6-sol")?.inputPerMillion == 4)
+        #expect(CodexPricing.price(for: "gpt-5.6-terra")?.outputPerMillion == 12)
+        #expect(CodexPricing.price(for: "gpt-5.6-luna")?.inputPerMillion == 0.2)
+        #expect(CodexPricing.price(for: "gpt-5.2")?.inputPerMillion == 1.75)
+        #expect(CodexPricing.price(for: "gpt-5.4")?.inputPerMillion == 2.5)
+        #expect(CodexPricing.price(for: "gpt-5.4")?.outputPerMillion == 15.0)
+        #expect(CodexPricing.price(for: "gpt-5.3-codex")?.inputPerMillion == 1.75)
+        #expect(CodexPricing.price(for: "gpt-5.1-codex-max")?.inputPerMillion == 1.25)
+        #expect(CodexPricing.price(for: "gpt-5.1-codex-max")?.outputPerMillion == 10.0)
     }
 
     @Test("Cached input is 90% off")
     func cachedDiscount() {
-        let price = CodexPricing.price(for: "gpt-5.1-codex")
+        let price = CodexPricing.price(for: "gpt-5.1-codex")!
         #expect(abs(price.cachedInputPerMillion - 0.125) < 0.0001)
     }
 
-    @Test("Family fallback for unknown ids")
+    @Test("Unknown models have no guessed price")
     func familyFallback() {
-        #expect(CodexPricing.price(for: "gpt-5.4-mini-preview").inputPerMillion == 2.5)
-        #expect(CodexPricing.price(for: "gpt-5.3-codex-spark").inputPerMillion == 1.75)
-        #expect(CodexPricing.price(for: "something-new").inputPerMillion == 1.25)
+        #expect(CodexPricing.price(for: "gpt-5.4-mini-preview") == nil)
+        #expect(CodexPricing.price(for: "gpt-5.4-mini-2026-03-17")?.inputPerMillion == 0.75)
+        #expect(CodexPricing.price(for: "gpt-5.3-codex-spark") == nil)
+        #expect(CodexPricing.price(for: "something-new") == nil)
+        #expect(CodexPricing.price(for: "codex-auto-review") == nil)
     }
 
     @Test("Cost math: input excludes cached, output includes reasoning")
@@ -36,7 +44,7 @@ struct CodexPricingTests {
             cachedInputTokens: 1_000_000,
             outputTokens: 1_000_000
         )
-        #expect(abs(cost - (1.25 + 0.125 + 10.0)) < 0.0001)
+        #expect(abs(cost! - (1.25 + 0.125 + 10.0)) < 0.0001)
     }
 }
 
@@ -188,7 +196,7 @@ struct CodexCostScannerAdapterTests {
         #expect(cost.todayCostUSD == 2.0)
         #expect(cost.last7DaysTokens == 1100)
         #expect(cost.last30DaysTokens == 2150)
-        #expect(abs(cost.last30DaysCostUSD - 3.0) < 0.0001)
+        #expect(abs(cost.last30DaysCostUSD! - 3.0) < 0.0001)
         #expect(cost.dailyCosts.count == 2)
         #expect(cost.dailyCosts[1].reasoningTokens == 60)
     }

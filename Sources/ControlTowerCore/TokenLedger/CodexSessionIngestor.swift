@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// Result of incrementally parsing a Codex rollout file.
@@ -22,7 +23,7 @@ struct CodexParseResult: Sendable {
 /// Codex emits `token_count` events whose `info.total_token_usage` is
 /// *cumulative* for the session and `info.last_token_usage` is the per-turn
 /// delta. Only deltas are summed, and an event is counted only when the
-/// cumulative total advances — heartbeat re-emissions of the same state are
+/// cumulative total advances. Heartbeat re-emissions of the same state are
 /// skipped. Verified against real rollouts: `cached_input_tokens` is a subset
 /// of `input_tokens`, `reasoning_output_tokens` a subset of `output_tokens`,
 /// and `total_tokens == input + output`.
@@ -37,10 +38,11 @@ enum CodexSessionIngestor {
     private static let chunkSize = 1 << 20
 
     private static let tokenUsagePattern = Array(#""total_token_usage""#.utf8)
-    private static let turnContextPattern = Array(#""type":"turn_context""#.utf8)
-    private static let sessionMetaPattern = Array(#""type":"session_meta""#.utf8)
+    private static let turnContextPattern = Array(#""turn_context""#.utf8)
+    private static let sessionMetaPattern = Array(#""session_meta""#.utf8)
+    private static let usageRecordPattern = Array(#""token_usage_record""#.utf8)
 
-    static let defaultModel = "gpt-5.1-codex"
+    static let defaultModel = "unknown"
 
     static func parse(
         fileURL: URL,
@@ -111,6 +113,7 @@ enum CodexSessionIngestor {
         // Track the active model from turn context (cheap byte prefilter first).
         if Self.contains(line, pattern: Self.turnContextPattern) {
             if let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+               obj["type"] as? String == "turn_context",
                let payload = obj["payload"] as? [String: Any],
                let contextModel = payload["model"] as? String, !contextModel.isEmpty {
                 model = contextModel.lowercased()
@@ -122,37 +125,45 @@ enum CodexSessionIngestor {
         // Project attribution from session metadata.
         if cwd == nil, Self.contains(line, pattern: Self.sessionMetaPattern) {
             if let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+               obj["type"] as? String == "session_meta",
                let payload = obj["payload"] as? [String: Any] {
                 cwd = payload["cwd"] as? String
             }
             return
         }
 
-        guard Self.contains(line, pattern: Self.tokenUsagePattern) else { return }
+        guard Self.contains(line, pattern: Self.tokenUsagePattern)
+            || Self.contains(line, pattern: Self.usageRecordPattern) else { return }
 
         guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-              let payload = obj["payload"] as? [String: Any],
-              let info = payload["info"] as? [String: Any],
-              let totalUsage = info["total_token_usage"] as? [String: Any] else {
+              let payload = obj["payload"] as? [String: Any] else {
             return
         }
 
-        // Count an event only when the session's cumulative total advances.
-        let total = Int64(Self.intValue(totalUsage["total_tokens"]))
-        guard total != lastTotal else { return }
-        if total < lastTotal {
-            // Cumulative totals never decrease in append-only rollouts;
-            // treat a regression as a new baseline without counting it.
-            lastTotal = total
-            return
+        let totalUsage: [String: Any]
+        let lastUsage: [String: Any]
+        let responseID: String?
+        if obj["type"] as? String == "token_usage_record" {
+            // Desktop writes a durable response record before its token_count
+            // notification. Advancing the same baseline skips the notification.
+            guard let total = payload["thread_token_usage"] as? [String: Any],
+                  let usage = payload["usage"] as? [String: Any] else { return }
+            totalUsage = total
+            lastUsage = usage
+            responseID = payload["response_id"] as? String
+        } else {
+            guard obj["type"] as? String == "event_msg",
+                  payload["type"] as? String == "token_count",
+                  let info = payload["info"] as? [String: Any],
+                  let total = info["total_token_usage"] as? [String: Any],
+                  let usage = info["last_token_usage"] as? [String: Any] else { return }
+            totalUsage = total
+            lastUsage = usage
+            responseID = nil
         }
-        lastTotal = total
-
-        // The per-turn delta is authoritative for what this event added.
-        guard let lastUsage = info["last_token_usage"] as? [String: Any] else { return }
 
         guard let timestamp = obj["timestamp"] as? String,
-              let hourStart = TranscriptIngestor.hourEpoch(fromTimestamp: timestamp, cache: &hourCache) else {
+              let hourStart = Self.usageBucket(from: timestamp, cache: &hourCache) else {
             return
         }
 
@@ -161,10 +172,23 @@ enum CodexSessionIngestor {
         let output = Self.intValue(lastUsage["output_tokens"])
         let reasoning = min(Self.intValue(lastUsage["reasoning_output_tokens"]), output)
 
-        guard input > 0 || output > 0 else { return }
+        // Skip mirrored notifications. A resumed session can reset its
+        // counters; then the new total is exactly the current response usage.
+        let total = Int64(Self.intValue(totalUsage["total_tokens"]))
+        guard total != lastTotal else { return }
+        if total < lastTotal, total != Int64(input + output) { return }
 
+        guard input > 0 || output > 0 else { return }
+        lastTotal = total
+
+        // Copied history in forks must not count again in another file.
+        // Older CLI records have no response ID; fingerprint their original
+        // timestamp and token counters instead of the enclosing session ID.
+        let fingerprint = "\(timestamp)|\(total)|\(input)|\(cached)|\(output)|\(reasoning)"
+        let dedupKey = responseID.flatMap { $0.isEmpty ? nil : "codex-response:\($0)" }
+            ?? "codex-event:" + SHA256.hash(data: Data(fingerprint.utf8)).map { String(format: "%02x", $0) }.joined()
         entries.append(ParsedUsageEntry(
-            dedupKey: nil, // monotonic-total check above is the dedup
+            dedupKey: dedupKey,
             hourStart: hourStart,
             model: model,
             inputTokens: input - cached,
@@ -176,9 +200,21 @@ enum CodexSessionIngestor {
     }
 
     private static func intValue(_ value: Any?) -> Int {
-        if let intVal = value as? Int { return intVal }
-        if let number = value as? NSNumber { return number.intValue }
+        if let intVal = value as? Int { return max(0, intVal) }
+        if let number = value as? NSNumber { return max(0, number.intValue) }
         return 0
+    }
+
+    // Minute buckets preserve local midnight in half-hour and quarter-hour
+    // timezones. UTC hour buckets shift the first part of a day backwards.
+    static func usageBucket(from timestamp: String, cache: inout [String: Int64]) -> Int64? {
+        let key = timestamp.hasSuffix("Z") ? String(timestamp.prefix(16)) + "Z" : timestamp
+        if let cached = cache[key] { return cached }
+        let style = Date.ISO8601FormatStyle(includingFractionalSeconds: timestamp.contains("."))
+        guard let date = try? Date(timestamp, strategy: style) else { return nil }
+        let bucket = Int64(date.timeIntervalSince1970) / 60 * 60
+        cache[key] = bucket
+        return bucket
     }
 
     private static func contains(_ data: Data, pattern: [UInt8]) -> Bool {

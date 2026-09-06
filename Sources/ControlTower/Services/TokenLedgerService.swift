@@ -11,6 +11,7 @@ import Logging
 @Observable
 final class TokenLedgerStore {
     private(set) var snapshot: LedgerSnapshot?
+    private(set) var codexSnapshot: CodexCostScanner.CostSnapshot?
     private(set) var isLoading = false
 
     private var refreshTask: Task<Void, Never>?
@@ -25,9 +26,12 @@ final class TokenLedgerStore {
         }
         self.isLoading = self.snapshot == nil
         self.refreshTask = Task { [weak self] in
-            let result = await TokenLedger.shared.snapshot(forceScan: force)
+            async let result = TokenLedger.shared.snapshot(forceScan: force)
+            async let codexResult = CodexCostScanner.shared.scan(forceRefresh: force)
+            let (claude, codex) = await (result, codexResult)
             guard let self else { return }
-            self.snapshot = result
+            self.snapshot = claude
+            self.codexSnapshot = codex
             self.isLoading = false
             self.refreshTask = nil
             if self.pendingRefresh {

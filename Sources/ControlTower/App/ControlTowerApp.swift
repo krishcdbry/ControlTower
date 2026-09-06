@@ -353,7 +353,7 @@ struct ProviderCard: View {
     private var providerDescription: String {
         switch self.provider {
         case .claude: return "Claude Code CLI"
-        case .codex: return "OpenAI Codex CLI"
+        case .codex: return "Codex Desktop and CLI"
         case .cursor: return "Cursor IDE"
         case .gemini: return "Google Gemini CLI"
         case .copilot: return "GitHub Copilot"
@@ -543,9 +543,9 @@ struct ProviderCard: View {
             ]
         case .codex:
             return [
-                "Install Codex CLI: npm install -g @openai/codex",
-                "Set OPENAI_API_KEY environment variable, or",
-                "Authenticate: codex auth login"
+                "Open Codex Desktop and sign in with ChatGPT",
+                "Or run 'codex login' in Terminal",
+                "API keys support local token tracking, but not subscription limits"
             ]
         case .cursor:
             return [

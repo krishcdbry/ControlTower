@@ -8,7 +8,7 @@ public struct CodexLedgerDay: Sendable, Equatable {
     public let cachedInputTokens: Int
     public let outputTokens: Int // includes reasoning
     public let reasoningTokens: Int // informational subset of output
-    public let costUSD: Double
+    public let costUSD: Double?
 
     /// Billable token volume (input + cached + output; reasoning is already inside output).
     public var totalTokens: Int { self.inputTokens + self.cachedInputTokens + self.outputTokens }
@@ -28,14 +28,15 @@ public struct CodexLedgerSnapshot: Sendable {
     }
 }
 
-/// Incremental token tracker for Codex CLI sessions, mirroring `TokenLedger`:
-/// per-file byte cursors, monotonic-total dedup, hour aggregates in SQLite,
+/// Incremental token tracker for Codex Desktop and CLI, mirroring `TokenLedger`:
+/// per-file byte cursors, global dedup, minute aggregates in SQLite,
 /// priced at query time. Steady-state scans are a stat pass over the roots.
 public actor CodexLedger {
     public static let shared = CodexLedger()
 
     private let logger = Logger(label: "com.controltower.codexledger")
     private let storeURL: URL
+    private let environment: [String: String]
     private var store: LedgerStore?
 
     private var cachedSnapshot: CodexLedgerSnapshot?
@@ -44,8 +45,9 @@ public actor CodexLedger {
     private let historyCutoffDays = 190
     private let windowDays = 30
 
-    public init(storeURL: URL? = nil) {
+    public init(storeURL: URL? = nil, environment: [String: String] = ProcessInfo.processInfo.environment) {
         self.storeURL = storeURL ?? Self.defaultStoreURL()
+        self.environment = environment
     }
 
     static func defaultStoreURL() -> URL {
@@ -68,7 +70,7 @@ public actor CodexLedger {
 
         do {
             let store = try self.openStore()
-            let stats = try await self.scan(store: store)
+            let stats = try self.scan(store: store)
             let snapshot = try self.buildSnapshot(store: store, stats: stats, now: Date())
             self.cachedSnapshot = snapshot
             self.lastScanAt = now
@@ -83,17 +85,12 @@ public actor CodexLedger {
     public nonisolated static func watchRoots(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> [URL] {
-        [Self.sessionsRoot(environment: environment)].filter {
-            FileManager.default.fileExists(atPath: $0.path)
-        }
+        // Watch the parent even before sessions or archived_sessions exists.
+        [CodexPaths.home(environment: environment)]
     }
 
     static func sessionsRoot(environment: [String: String]) -> URL {
-        if let envPath = environment["CODEX_HOME"], !envPath.isEmpty {
-            return URL(fileURLWithPath: envPath).appendingPathComponent("sessions", isDirectory: true)
-        }
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".codex/sessions", isDirectory: true)
+        CodexPaths.sessionRoots(environment: environment)[0]
     }
 
     // MARK: - Store
@@ -107,11 +104,24 @@ public actor CodexLedger {
 
     // MARK: - Scanning
 
-    private func scan(store: LedgerStore) async throws -> LedgerScanStats {
+    private func scan(store: LedgerStore) throws -> LedgerScanStats {
         let started = Date()
-        let roots = Self.watchRoots(environment: ProcessInfo.processInfo.environment)
-        let cursors = try store.allCursors()
+        let files = CodexPaths.sessionRoots(environment: self.environment)
+            .flatMap { TokenLedger.transcriptFiles(in: $0) }
+            .sorted { $0.url.path < $1.url.path }
+        let paths = Set(files.map { $0.url.path })
+        var cursors = try store.allCursors()
         let isInitialScan = cursors.isEmpty
+
+        // Removing or rewriting the owner of a dedup key requires replaying
+        // retained files so copied history still has exactly one owner.
+        if !Set(cursors.keys).isSubset(of: paths) || files.contains(where: {
+            guard let cursor = cursors[$0.url.path] else { return false }
+            return $0.size < cursor.offset || ($0.size == cursor.size && $0.mtime != cursor.mtime)
+        }) {
+            for path in cursors.keys { try store.resetFile(path: path) }
+            cursors = [:]
+        }
 
         var filesSeen = 0
         var filesParsed = 0
@@ -121,69 +131,64 @@ public actor CodexLedger {
 
         let cutoff = started.addingTimeInterval(-Double(self.historyCutoffDays) * 86400).timeIntervalSince1970
 
-        for root in roots {
-            for file in TokenLedger.transcriptFiles(in: root) {
-                filesSeen += 1
-                existingPaths.insert(file.url.path)
+        for file in files {
+            filesSeen += 1
+            existingPaths.insert(file.url.path)
 
-                let cursor = cursors[file.url.path]
+            let cursor = cursors[file.url.path]
 
-                if let cursor, cursor.size == file.size, cursor.mtime == file.mtime {
-                    continue
-                }
+            if let cursor, cursor.size == file.size, cursor.mtime == file.mtime {
+                continue
+            }
 
-                // Old, never-seen file: cursor-mark without parsing (rollouts
-                // are append-only, so nothing in the window is skipped).
-                if cursor == nil, file.mtime < cutoff {
-                    try store.commit(
-                        path: file.url.path, source: "codex", project: "",
-                        entries: [], size: file.size, mtime: file.mtime, offset: file.size
-                    )
-                    continue
-                }
+            // Old, never-seen file: cursor-mark without parsing (rollouts
+            // are append-only, so nothing in the window is skipped).
+            if cursor == nil, file.mtime < cutoff {
+                try store.commit(
+                    path: file.url.path, source: "codex", project: "",
+                    entries: [], size: file.size, mtime: file.mtime, offset: file.size
+                )
+                continue
+            }
 
-                var parseFrom: Int64 = 0
-                var lastTotal: Int64 = 0
-                var model = CodexSessionIngestor.defaultModel
-                if let cursor {
-                    if file.size >= cursor.offset {
-                        parseFrom = cursor.offset
-                        lastTotal = cursor.auxInt
-                        if !cursor.auxText.isEmpty { model = cursor.auxText }
-                    } else {
-                        try store.resetFile(path: file.url.path)
-                    }
-                }
-
-                do {
-                    let result = try CodexSessionIngestor.parse(
-                        fileURL: file.url,
-                        from: parseFrom,
-                        lastTotalTokens: lastTotal,
-                        model: model
-                    )
-                    let accepted = try store.commit(
-                        path: file.url.path,
-                        source: "codex",
-                        project: result.cwd ?? cursor?.project ?? "",
-                        entries: result.entries,
-                        size: file.size,
-                        mtime: file.mtime,
-                        offset: result.newOffset,
-                        auxInt: result.lastTotalTokens,
-                        auxText: result.model
-                    )
-                    filesParsed += 1
-                    bytesParsed += result.bytesRead
-                    entriesAdded += accepted
-                } catch {
-                    self.logger.warning("Failed to ingest \(file.url.lastPathComponent): \(error)")
-                }
-
-                if filesParsed % 16 == 0 {
-                    await Task.yield()
+            var parseFrom: Int64 = 0
+            var lastTotal: Int64 = 0
+            var model = CodexSessionIngestor.defaultModel
+            if let cursor {
+                if file.size >= cursor.offset {
+                    parseFrom = cursor.offset
+                    lastTotal = cursor.auxInt
+                    if !cursor.auxText.isEmpty { model = cursor.auxText }
+                } else {
+                    try store.resetFile(path: file.url.path)
                 }
             }
+
+            do {
+                let result = try CodexSessionIngestor.parse(
+                    fileURL: file.url,
+                    from: parseFrom,
+                    lastTotalTokens: lastTotal,
+                    model: model
+                )
+                let accepted = try store.commit(
+                    path: file.url.path,
+                    source: "codex",
+                    project: result.cwd ?? cursor?.project ?? "",
+                    entries: result.entries,
+                    size: file.size,
+                    mtime: file.mtime,
+                    offset: result.newOffset,
+                    auxInt: result.lastTotalTokens,
+                    auxText: result.model
+                )
+                filesParsed += 1
+                bytesParsed += result.bytesRead
+                entriesAdded += accepted
+            } catch {
+                self.logger.warning("Failed to ingest \(file.url.lastPathComponent): \(error)")
+            }
+
         }
 
         try store.purgeMissingFiles(existingPaths: existingPaths)
@@ -218,6 +223,7 @@ public actor CodexLedger {
             var output = 0
             var reasoning = 0
             var cost: Double = 0
+            var hasUnknownPrice = false
         }
         var dayBuckets: [String: DayBucket] = [:]
         var dayKeyCache: [Int64: String] = [:]
@@ -248,7 +254,7 @@ public actor CodexLedger {
             bucket.cached += row.cacheReadTokens
             bucket.output += row.outputTokens
             bucket.reasoning += row.cacheWrite5mTokens
-            bucket.cost += cost
+            if let cost { bucket.cost += cost } else { bucket.hasUnknownPrice = true }
             dayBuckets[dayKey] = bucket
         }
 
@@ -260,7 +266,7 @@ public actor CodexLedger {
                 cachedInputTokens: bucket.cached,
                 outputTokens: bucket.output,
                 reasoningTokens: bucket.reasoning,
-                costUSD: bucket.cost
+                costUSD: bucket.hasUnknownPrice ? nil : bucket.cost
             )
         }
 

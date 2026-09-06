@@ -124,10 +124,10 @@ public enum ProviderRegistry {
                 quotaLabel: "Weekly",
                 supportsCredits: true,
                 supportsMultiAccount: true,
-                dashboardURL: URL(string: "https://platform.openai.com/usage"),
+                dashboardURL: URL(string: "https://chatgpt.com/codex/settings/usage"),
                 statusPageURL: URL(string: "https://status.openai.com"),
                 defaultRefreshInterval: 300,
-                description: "OpenAI Codex CLI usage"
+                description: "Codex Desktop and CLI usage"
             ),
             branding: ProviderBranding(
                 iconStyle: IconStyle.codex,

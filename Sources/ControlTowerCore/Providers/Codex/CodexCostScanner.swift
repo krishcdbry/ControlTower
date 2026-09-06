@@ -4,8 +4,8 @@ import Foundation
 ///
 /// This is now a thin adapter over `CodexLedger`, which ingests Codex rollout
 /// files incrementally (per-file byte cursors + monotonic-total dedup + SQLite
-/// aggregates) instead of re-reading every session file on each scan. The
-/// public snapshot shape is unchanged.
+/// aggregates) instead of re-reading every session file on each scan.
+/// Costs are nil when a period includes models without known pricing.
 ///
 /// Counting semantics (verified against real rollouts): per-turn deltas from
 /// `last_token_usage` are summed; `cached_input_tokens` is a subset of input
@@ -22,9 +22,9 @@ public actor CodexCostScanner {
         public let cachedInputTokens: Int
         /// Output tokens (reasoning included).
         public let outputTokens: Int
-        /// Reasoning tokens — an informational subset of `outputTokens`.
+        /// Reasoning tokens, an informational subset of `outputTokens`.
         public let reasoningTokens: Int
-        public let costUSD: Double
+        public let costUSD: Double?
 
         public var totalTokens: Int {
             // Reasoning is inside outputTokens; adding it would double-count.
@@ -37,7 +37,7 @@ public actor CodexCostScanner {
             cachedInputTokens: Int,
             outputTokens: Int,
             reasoningTokens: Int,
-            costUSD: Double
+            costUSD: Double?
         ) {
             self.date = date
             self.inputTokens = inputTokens
@@ -50,21 +50,21 @@ public actor CodexCostScanner {
 
     /// Cost snapshot with aggregated data
     public struct CostSnapshot: Sendable {
-        public let todayCostUSD: Double
+        public let todayCostUSD: Double?
         public let todayTokens: Int
-        public let last7DaysCostUSD: Double
+        public let last7DaysCostUSD: Double?
         public let last7DaysTokens: Int
-        public let last30DaysCostUSD: Double
+        public let last30DaysCostUSD: Double?
         public let last30DaysTokens: Int
         public let dailyCosts: [DailyCost]
         public let updatedAt: Date
 
         public init(
-            todayCostUSD: Double = 0,
+            todayCostUSD: Double? = 0,
             todayTokens: Int = 0,
-            last7DaysCostUSD: Double = 0,
+            last7DaysCostUSD: Double? = 0,
             last7DaysTokens: Int = 0,
-            last30DaysCostUSD: Double = 0,
+            last30DaysCostUSD: Double? = 0,
             last30DaysTokens: Int = 0,
             dailyCosts: [DailyCost] = [],
             updatedAt: Date = Date()
@@ -91,21 +91,27 @@ public actor CodexCostScanner {
     /// No-op retained for API compatibility; the ledger persists its own state.
     public func clearCache() {}
 
+    private static func addCost(_ lhs: Double?, _ rhs: Double?) -> Double? {
+        guard let lhs, let rhs else { return nil }
+        return lhs + rhs
+    }
+
     static func adapt(_ ledger: CodexLedgerSnapshot, now: Date = Date()) -> CostSnapshot {
         var calendar = Calendar.current
         calendar.timeZone = TimeZone.current
         let todayKey = TokenLedger.dayKey(for: now, calendar: calendar)
         let last7Start = TokenLedger.dayKey(for: now.addingTimeInterval(-6 * 86400), calendar: calendar)
 
-        var todayCost = 0.0, todayTokens = 0
-        var last7Cost = 0.0, last7Tokens = 0
-        var last30Cost = 0.0, last30Tokens = 0
+        var todayCost: Double? = 0
+        var last7Cost: Double? = 0
+        var last30Cost: Double? = 0
+        var todayTokens = 0, last7Tokens = 0, last30Tokens = 0
 
         let dailyCosts = ledger.days.map { day -> DailyCost in
-            last30Cost += day.costUSD
+            last30Cost = Self.addCost(last30Cost, day.costUSD)
             last30Tokens += day.totalTokens
             if day.date >= last7Start {
-                last7Cost += day.costUSD
+                last7Cost = Self.addCost(last7Cost, day.costUSD)
                 last7Tokens += day.totalTokens
             }
             if day.date == todayKey {
@@ -138,8 +144,15 @@ public actor CodexCostScanner {
 // MARK: - Codex Pricing
 
 /// Pricing for OpenAI models used by Codex (per million tokens, USD).
-/// Source: OpenAI API pricing (cached 2026-06). Cached input is billed at
-/// a 90% discount on these models. Reasoning tokens are billed as output.
+/// Standard API estimates, verified 2026-09-06 against:
+/// https://developers.openai.com/api/docs/models/gpt-6-astra
+/// https://developers.openai.com/api/docs/models/gpt-5.6-sol
+/// https://developers.openai.com/api/docs/models/gpt-5.6-terra
+/// https://developers.openai.com/api/docs/models/gpt-5.6-luna
+/// https://developers.openai.com/api/docs/models/gpt-5.4-mini
+/// https://developers.openai.com/api/docs/models/gpt-5.2
+/// These base rates exclude service-tier, long-context, and cache-write
+/// surcharges. They are not the cost of a ChatGPT subscription.
 public enum CodexPricing {
     public struct ModelPrice: Sendable {
         public let inputPerMillion: Double
@@ -162,11 +175,17 @@ public enum CodexPricing {
     private static let codexMini = ModelPrice(input: 1.50, output: 6.0)
 
     public static let pricing: [String: ModelPrice] = [
+        "gpt-6-astra": ModelPrice(input: 10.0, output: 50.0),
+        "gpt-5.6": ModelPrice(input: 4.0, output: 20.0),
+        "gpt-5.6-sol": ModelPrice(input: 4.0, output: 20.0),
+        "gpt-5.6-terra": ModelPrice(input: 2.0, output: 12.0),
+        "gpt-5.6-luna": ModelPrice(input: 0.20, output: 1.20),
         "gpt-5.5": gpt55,
+        "gpt-5.4-mini": ModelPrice(input: 0.75, output: 4.5),
         "gpt-5.4": gpt54,
         "gpt-5.3-codex": codex53,
         "gpt-5.2-codex": codex53,
-        "gpt-5.2": gpt51Family,
+        "gpt-5.2": codex53,
         "gpt-5.1-codex-max": gpt51Family,
         "gpt-5.1-codex": gpt51Family,
         "gpt-5.1": gpt51Family,
@@ -177,20 +196,15 @@ public enum CodexPricing {
         "o4-mini": o4Mini,
     ]
 
-    /// Default for unknown models (the common Codex tier).
-    public static let defaultPricing = gpt51Family
-
-    public static func price(for model: String) -> ModelPrice {
-        let normalized = model.lowercased().trimmingCharacters(in: .whitespaces)
-        if let exact = pricing[normalized] {
-            return exact
+    /// Only published model IDs and their dated snapshots have known prices.
+    /// An unknown model must not silently inherit another model's rate.
+    public static func price(for model: String) -> ModelPrice? {
+        let normalized = model.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if let exact = pricing[normalized] { return exact }
+        if let suffix = normalized.range(of: #"-\d{4}-\d{2}-\d{2}$"#, options: .regularExpression) {
+            return pricing[String(normalized[..<suffix.lowerBound])]
         }
-        if normalized.contains("5.5") { return gpt55 }
-        if normalized.contains("5.4") { return gpt54 }
-        if normalized.contains("5.3") || normalized.contains("5.2-codex") { return codex53 }
-        if normalized.contains("o4-mini") { return o4Mini }
-        if normalized.contains("codex-mini") { return codexMini }
-        return defaultPricing
+        return nil
     }
 
     /// Cost for usage where `inputTokens` excludes cached tokens and
@@ -200,8 +214,8 @@ public enum CodexPricing {
         inputTokens: Int,
         cachedInputTokens: Int,
         outputTokens: Int
-    ) -> Double {
-        let price = Self.price(for: model)
+    ) -> Double? {
+        guard let price = Self.price(for: model) else { return nil }
         return Double(inputTokens) / 1_000_000 * price.inputPerMillion
             + Double(cachedInputTokens) / 1_000_000 * price.cachedInputPerMillion
             + Double(outputTokens) / 1_000_000 * price.outputPerMillion

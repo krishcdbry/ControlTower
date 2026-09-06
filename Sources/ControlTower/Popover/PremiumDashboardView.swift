@@ -15,7 +15,7 @@ struct PremiumDashboardView: View {
     var onClose: () -> Void = {}
 
     @State private var selectedProvider: ProviderID?
-    @State private var codexCostSnapshot: CodexCostScanner.CostSnapshot?
+    private var codexCostSnapshot: CodexCostScanner.CostSnapshot? { ledgerStore.codexSnapshot }
     @State private var isLoadingCost = false
     @State private var selectedHeatDay: String?
     @State private var heatDayDetail: LedgerDayDetail?
@@ -80,8 +80,7 @@ struct PremiumDashboardView: View {
     private func loadCostData() async {
         isLoadingCost = true
         defer { isLoadingCost = false }
-        ledgerStore.refresh()
-        codexCostSnapshot = await CodexCostScanner.shared.scan()
+        await ledgerStore.refreshAndWait()
     }
 
     private func loadProviderCostData(_ provider: ProviderID?) async {
@@ -89,10 +88,8 @@ struct PremiumDashboardView: View {
         isLoadingCost = true
         defer { isLoadingCost = false }
         switch provider {
-        case .claude:
-            ledgerStore.refresh()
-        case .codex:
-            codexCostSnapshot = await CodexCostScanner.shared.scan()
+        case .claude, .codex:
+            await ledgerStore.refreshAndWait()
         default:
             break
         }
@@ -148,8 +145,15 @@ struct PremiumDashboardView: View {
         }
     }
 
+    private var measuredUsage: Double? {
+        enabledProviders.compactMap { provider -> Double? in
+            guard let snapshot = usageStore.snapshots[provider], snapshot.hasUsageWindows else { return nil }
+            return snapshot.highestUsagePercent
+        }.max()
+    }
+
     private var overallStatusText: String {
-        let maxUsage = enabledProviders.compactMap { usageStore.snapshots[$0]?.highestUsagePercent }.max() ?? 0
+        guard let maxUsage = measuredUsage else { return "Unavailable" }
         if maxUsage >= 95 { return "Critical" }
         if maxUsage >= 80 { return "High" }
         if maxUsage >= 50 { return "Moderate" }
@@ -157,7 +161,7 @@ struct PremiumDashboardView: View {
     }
 
     private var overallStatusColor: Color {
-        let maxUsage = enabledProviders.compactMap { usageStore.snapshots[$0]?.highestUsagePercent }.max() ?? 0
+        guard let maxUsage = measuredUsage else { return .gray }
         if maxUsage >= 95 { return .red }
         if maxUsage >= 80 { return .orange }
         if maxUsage >= 50 { return .yellow }
@@ -165,7 +169,7 @@ struct PremiumDashboardView: View {
     }
 
     private var overallStatusIcon: String {
-        let maxUsage = enabledProviders.compactMap { usageStore.snapshots[$0]?.highestUsagePercent }.max() ?? 0
+        guard let maxUsage = measuredUsage else { return "questionmark.circle" }
         if maxUsage >= 95 { return "exclamationmark.triangle.fill" }
         if maxUsage >= 80 { return "exclamationmark.circle.fill" }
         if maxUsage >= 50 { return "gauge.with.dots.needle.50percent" }
@@ -302,6 +306,11 @@ struct PremiumDashboardView: View {
                         last30DaysTokens: costData.last30DaysTokens,
                         last30DaysCost: costData.last30DaysCostUSD
                     )
+                    Text(costData.last30DaysCostUSD == nil
+                         ? "Token totals include models without known prices. Cost is unavailable for those periods."
+                         : "Estimated API cost at standard base rates. Subscription charges and pricing modifiers are excluded.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.white.opacity(0.6))
                 } else if isLoadingCost {
                     TokenLoadingPlaceholder()
                 }
@@ -318,9 +327,11 @@ struct PremiumDashboardView: View {
                     ChartLoadingPlaceholder()
                 }
             } else if provider == .codex {
-                if let costData = codexCostSnapshot, !costData.dailyCosts.isEmpty {
+                if let costData = codexCostSnapshot, !costData.dailyCosts.isEmpty, costData.last30DaysCostUSD != nil {
                     GlassCostChartCard(
-                        dailyCosts: costData.dailyCosts.map { .init(date: $0.date, totalTokens: $0.totalTokens, costUSD: $0.costUSD) },
+                        dailyCosts: costData.dailyCosts.compactMap { day in
+                            day.costUSD.map { .init(date: day.date, totalTokens: day.totalTokens, costUSD: $0) }
+                        },
                         updatedAt: costData.updatedAt
                     )
                 } else if isLoadingCost {
@@ -361,11 +372,11 @@ struct PremiumDashboardView: View {
 
     struct SimpleTokenSummary: View {
         let todayTokens: Int
-        let todayCost: Double
+        let todayCost: Double?
         let last7DaysTokens: Int
-        let last7DaysCost: Double
+        let last7DaysCost: Double?
         let last30DaysTokens: Int
-        let last30DaysCost: Double
+        let last30DaysCost: Double?
 
         var body: some View {
             HStack(spacing: 20) {
@@ -394,7 +405,7 @@ struct PremiumDashboardView: View {
             }
         }
 
-        private func tokenColumn(_ title: String, tokens: Int, cost: Double) -> some View {
+        private func tokenColumn(_ title: String, tokens: Int, cost: Double?) -> some View {
             VStack(spacing: 4) {
                 Text(title)
                     .font(.system(size: 10, weight: .medium))
@@ -404,7 +415,7 @@ struct PremiumDashboardView: View {
                     .font(.system(size: 15, weight: .bold, design: .rounded))
                     .foregroundStyle(.white)
 
-                Text(String(format: "$%.2f", cost))
+                Text(cost.map { String(format: "$%.2f", $0) } ?? "Price unavailable")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.green)
             }
@@ -601,7 +612,7 @@ struct GlassProviderCard: View {
                 Spacer(minLength: 4)
 
                 // Usage display
-                if let _ = snapshot {
+                if let snapshot, snapshot.hasUsageWindows {
                     HStack(alignment: .bottom, spacing: 4) {
                         Text("\(Int(usagePercent))")
                             .font(.system(size: 28, weight: .bold, design: .rounded))
@@ -618,6 +629,10 @@ struct GlassProviderCard: View {
                     // Full width progress bar using ProgressView style
                     ProgressView(value: usagePercent, total: 100)
                         .progressViewStyle(GlassProgressStyle(color: usageColor))
+                } else if snapshot != nil {
+                    Text("Usage unavailable")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 } else if error != nil {
                     HStack {
                         Image(systemName: "arrow.right.circle.fill")
@@ -774,7 +789,7 @@ struct GlassDetailCard: View {
 
                 Spacer()
 
-                if let snapshot {
+                if let snapshot, snapshot.hasUsageWindows {
                     VStack(alignment: .trailing, spacing: 2) {
                         Text("\(Int(snapshot.highestUsagePercent))%")
                             .font(.system(size: 36, weight: .bold, design: .rounded))
@@ -788,6 +803,11 @@ struct GlassDetailCard: View {
             }
 
             if let snapshot {
+                if !snapshot.hasUsageWindows {
+                    Text("Subscription usage is unavailable. Local token tracking is still shown below.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
                 // Usage bars - clean list, no boxes
                 VStack(spacing: 16) {
                     if let primary = snapshot.primary {
@@ -1165,7 +1185,7 @@ struct GlassSetupCard: View {
         case .claude:
             return ("Sign in to Claude", ["Run 'claude' in Terminal", "Complete browser authentication"], "https://console.anthropic.com")
         case .codex:
-            return ("Sign in to Codex", ["Run 'codex' in Terminal", "Complete authentication"], "https://platform.openai.com")
+            return ("Sign in to Codex", ["Sign in to Codex Desktop with ChatGPT", "Or run 'codex login' in Terminal"], "https://chatgpt.com/codex")
         case .cursor:
             return ("Sign in to Cursor", ["Open cursor.com in browser", "Sign in to your account"], "https://cursor.com/settings")
         case .gemini:

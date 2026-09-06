@@ -14,7 +14,7 @@ struct ControlTowerCLI {
 
         switch command {
         case "status", "s":
-            await Self.showStatus()
+            await Self.showStatus(providerName: arguments.dropFirst().first)
         case "tokens", "t":
             await Self.showTokens(arguments: Array(arguments.dropFirst()))
         case "list", "l":
@@ -31,15 +31,25 @@ struct ControlTowerCLI {
 
     // MARK: - Commands
 
-    static func showStatus() async {
+    static func showStatus(providerName: String? = nil) async {
+        let selected = providerName.flatMap { ProviderRegistry.provider(forCLIName: $0) }
+        if let providerName, selected == nil {
+            print("Unknown provider: \(providerName)")
+            return
+        }
         print("Control Tower Status")
         print("====================")
         print()
 
         let context = ProviderService.defaultCLIContext()
-        let results = await ProviderService.shared.fetchAll(context: context)
+        let results: [ProviderID: ProviderFetchOutcome]
+        if let selected {
+            results = [selected: await ProviderService.shared.fetch(provider: selected, context: context)]
+        } else {
+            results = await ProviderService.shared.fetchAll(context: context)
+        }
 
-        for provider in ProviderID.allCases {
+        for provider in selected.map({ [$0] }) ?? ProviderID.allCases {
             let descriptor = ProviderRegistry.descriptor(for: provider)
             print("\(descriptor.metadata.displayName):")
 
@@ -47,10 +57,10 @@ struct ControlTowerCLI {
                 switch outcome.result {
                 case .success(let result):
                     if let primary = result.usage.primary {
-                        print("  \(descriptor.metadata.sessionLabel): \(String(format: "%.1f%%", primary.usedPercent)) used")
+                        print("  \(primary.label ?? descriptor.metadata.sessionLabel): \(String(format: "%.1f%%", primary.usedPercent)) used")
                     }
                     if let secondary = result.usage.secondary {
-                        print("  \(descriptor.metadata.quotaLabel): \(String(format: "%.1f%%", secondary.usedPercent)) used")
+                        print("  \(secondary.label ?? descriptor.metadata.quotaLabel): \(String(format: "%.1f%%", secondary.usedPercent)) used")
                     }
                     if let tertiary = result.usage.tertiary, descriptor.metadata.supportsTertiary {
                         print("  \(descriptor.metadata.tertiaryLabel ?? "Tertiary"): \(String(format: "%.1f%%", tertiary.usedPercent)) used")
@@ -170,14 +180,19 @@ struct ControlTowerCLI {
             return "\(tokens)"
         }
 
+        func money(_ value: Double?) -> String {
+            value.map { String(format: "$%.2f", $0) } ?? "Price unavailable"
+        }
+
         print("Codex Token Ledger")
         print("==================")
         print()
         print("  Period         Tokens     Cost")
-        print("  Today          \(fmt(cost.todayTokens).padding(toLength: 10, withPad: " ", startingAt: 0)) $\(String(format: "%.2f", cost.todayCostUSD))")
-        print("  Last 7 days    \(fmt(cost.last7DaysTokens).padding(toLength: 10, withPad: " ", startingAt: 0)) $\(String(format: "%.2f", cost.last7DaysCostUSD))")
-        print("  Last 30 days   \(fmt(cost.last30DaysTokens).padding(toLength: 10, withPad: " ", startingAt: 0)) $\(String(format: "%.2f", cost.last30DaysCostUSD))")
+        print("  Today          \(fmt(cost.todayTokens).padding(toLength: 10, withPad: " ", startingAt: 0)) \(money(cost.todayCostUSD))")
+        print("  Last 7 days    \(fmt(cost.last7DaysTokens).padding(toLength: 10, withPad: " ", startingAt: 0)) \(money(cost.last7DaysCostUSD))")
+        print("  Last 30 days   \(fmt(cost.last30DaysTokens).padding(toLength: 10, withPad: " ", startingAt: 0)) \(money(cost.last30DaysCostUSD))")
 
+        print("  Costs are API estimates at base rates, excluding subscription charges and pricing modifiers.")
         if !cost.dailyCosts.isEmpty {
             print()
             print("Days with activity (30d): \(cost.dailyCosts.count)")
@@ -220,7 +235,7 @@ struct ControlTowerCLI {
             ct <command> [options]
 
         COMMANDS:
-            status, s       Show usage status for all providers
+            status, s       Show usage status (optionally: status codex)
             tokens, t       Show Claude token usage and costs (all apps)
             tokens codex    Show Codex token usage and costs
             list, l         List supported providers

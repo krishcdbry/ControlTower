@@ -97,12 +97,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // scans are incremental).
         self.ledgerStore.refresh()
 
-        // Watch transcript directories so token counts update live while
-        // Claude Code / Claude Desktop / Cowork sessions are running.
-        let watchPaths = TokenLedger.watchRoots().map(\.path)
+        // Include both providers so desktop and CLI usage updates live.
+        let watchPaths = (TokenLedger.watchRoots() + CodexLedger.watchRoots()).map(\.path)
         self.transcriptWatcher = TranscriptWatcher(paths: watchPaths) { [weak self] in
             Task { @MainActor [weak self] in
-                self?.ledgerStore.refresh()
+                self?.ledgerStore.refresh(force: true)
             }
         }
 
