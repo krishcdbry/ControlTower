@@ -13,6 +13,7 @@ final class TokenLedgerStore {
     private(set) var snapshot: LedgerSnapshot?
     private(set) var codexLedger: CodexLedgerSnapshot?
     private(set) var codexSnapshot: CodexCostScanner.CostSnapshot?
+    private(set) var combinedSnapshot: CombinedUsageSnapshot?
     private(set) var isLoading = false
 
     private var refreshTask: Task<Void, Never>?
@@ -34,6 +35,7 @@ final class TokenLedgerStore {
             self.snapshot = claude
             self.codexLedger = codex
             self.codexSnapshot = CodexCostScanner.adapt(codex)
+            self.combinedSnapshot = CombinedUsageSnapshot.build(snapshots: [.claude: claude, .codex: codex.analytics])
             self.isLoading = false
             self.refreshTask = nil
             if self.pendingRefresh {
@@ -52,6 +54,13 @@ final class TokenLedgerStore {
     func dayDetail(_ date: String, provider: ProviderID = .claude) async -> LedgerDayDetail? {
         if provider == .codex { return await CodexLedger.shared.dayDetail(date: date) }
         return await TokenLedger.shared.dayDetail(date: date)
+    }
+
+    func combinedDayDetail(_ date: String) async -> LedgerDayDetail? {
+        async let claude = TokenLedger.shared.dayDetail(date: date)
+        async let codex = CodexLedger.shared.dayDetail(date: date)
+        let details = await [claude, codex].compactMap { $0 }
+        return CombinedUsageSnapshot.mergeDayDetails(details, date: date)
     }
 }
 

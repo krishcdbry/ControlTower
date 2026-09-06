@@ -15,6 +15,7 @@ struct PremiumDashboardView: View {
     var onClose: () -> Void = {}
 
     @State private var selectedProvider: ProviderID?
+    @State private var showingCombinedUsage = false
     @State private var isLoadingCost = false
     @State private var selectedHeatDay: String?
     @State private var heatDayDetail: LedgerDayDetail?
@@ -37,16 +38,27 @@ struct PremiumDashboardView: View {
                 // Main content - scrollable
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 12) {
-                        if let selected = selectedProvider {
+                        if showingCombinedUsage {
+                            CombinedUsageDetailView(ledgerStore: ledgerStore, enabledProviders: enabledProviders) {
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                    showingCombinedUsage = false
+                                }
+                            }
+                        } else if let selected = selectedProvider {
                             // Detail view for selected provider
                             providerDetailSection(selected)
                         } else {
-                            // Provider grid
+                            CombinedUsageHomeCard(snapshot: ledgerStore.combinedSnapshot) {
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                                    showingCombinedUsage = true
+                                }
+                            }
                             providerGridSection
                         }
                     }
                     .padding(.horizontal, 16)
                 }
+                .id(showingCombinedUsage ? "combined" : selectedProvider?.rawValue ?? "overview")
 
                 // Footer
                 footerSection
